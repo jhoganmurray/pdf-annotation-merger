@@ -1,10 +1,9 @@
-PDF COMMENT COLLECTOR
-=====================
+PDF COMMENT COLLECTOR & MERGER
+==============================
 
-Collects unique comments/annotations from multiple PDF versions and creates
-an XFDF file that you can import into Adobe Acrobat.
-
-This tool does NOT modify your PDFs - it only reads them and outputs XFDF.
+Collects unique comments/annotations from multiple PDF versions and either:
+- Creates an XFDF file for manual import into Adobe Acrobat, OR
+- Merges them directly into a new PDF (no Acrobat needed!)
 
 
 THE PROBLEM
@@ -24,12 +23,18 @@ HOW TO USE
 
 4. Click "Preview" to see what new comments were found
 
-5. Click "Create XFDF" to generate the import file
+5. Choose your export method:
 
-6. Open your base PDF in Adobe Acrobat:
-   Comment menu → Import Comments → select the XFDF file
+   OPTION A - Merge & Save PDF (Recommended)
+   * Click "Merge & Save PDF"
+   * Choose where to save the merged PDF
+   * Done! The new PDF contains all comments.
 
-7. Save your PDF
+   OPTION B - Create XFDF (Manual import)
+   * Click "Create XFDF" to generate the import file
+   * Open your base PDF in Adobe Acrobat
+   * Comment menu -> Import Comments -> select the XFDF file
+   * Save your PDF
 
 
 REQUIREMENTS
@@ -37,11 +42,15 @@ REQUIREMENTS
 - Windows 10 or later
 - Python 3.8+ (https://www.python.org/downloads/)
   * Check "Add Python to PATH" during installation
-- Adobe Acrobat Pro (for importing the XFDF)
+
+Dependencies (auto-installed on first run):
+- pymupdf  - For reading PDF annotations
+- pikepdf  - For direct PDF merging (optional but recommended)
 
 
 FILES
 -----
 - Run_Comment_Collector.bat  - Double-click to start
-- PDF_Comment_Collector.pyw  - The application
+- PDF_Comment_Collector.pyw  - The main application
+- xfdf_importer.py           - PDF merge engine (pikepdf-based)
 - README.txt                 - This file

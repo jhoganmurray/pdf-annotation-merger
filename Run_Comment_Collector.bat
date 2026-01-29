@@ -25,5 +25,16 @@ if errorlevel 1 (
     )
 )
 
+REM Check if pikepdf is installed, install if not (for direct merge feature)
+python -c "import pikepdf" >nul 2>&1
+if errorlevel 1 (
+    echo Installing optional dependency (pikepdf) for direct PDF merge...
+    pip install pikepdf
+    if errorlevel 1 (
+        echo Note: pikepdf not installed. Merge feature will be disabled.
+        echo You can still use XFDF export.
+    )
+)
+
 REM Run the application
 pythonw "%~dp0PDF_Comment_Collector.pyw"

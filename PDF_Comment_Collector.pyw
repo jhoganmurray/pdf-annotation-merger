@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-PDF Comment Collector
+PDF Comment Collector & Merger
 
-Collects unique annotations from multiple PDF versions and exports them
-as an XFDF file that can be imported into Adobe Acrobat.
-
-This tool does NOT modify any PDFs. It only reads and produces XFDF output.
+Collects unique annotations from multiple PDF versions and either:
+- Exports them as XFDF for manual import into Adobe Acrobat
+- Merges them directly into the base PDF using pikepdf
 
 Workflow:
 1. Select your BASE PDF (the one you want to add comments to)
 2. Select OTHER PDFs (the divergent copies with additional comments)
-3. Click "Create XFDF" to generate a file with only the NEW comments
-4. In Adobe Acrobat, open your base PDF and use:
-   Comment → Import Comments → select the XFDF file
+3. Either:
+   - Click "Create XFDF" for manual import later, OR
+   - Click "Merge & Save" to create a new PDF with all comments
 
 Requirements:
-    pip install pymupdf
+    pip install pymupdf pikepdf
 """
 
 import os
@@ -40,6 +39,14 @@ except ImportError:
         "Then try again."
     )
     sys.exit(1)
+
+# Optional: pikepdf for direct PDF merging
+PIKEPDF_AVAILABLE = False
+try:
+    from xfdf_importer import import_annotations_direct
+    PIKEPDF_AVAILABLE = True
+except ImportError:
+    pass
 
 
 # =============================================================================
@@ -328,6 +335,17 @@ class CommentCollectorApp:
                                       command=self.create_xfdf)
         self.create_btn.pack(side=tk.RIGHT)
 
+        # Merge & Save button (only if pikepdf available)
+        if PIKEPDF_AVAILABLE:
+            self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
+                                         command=self.merge_and_save)
+            self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
+        else:
+            # Show disabled button with tooltip-style label
+            self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
+                                         state='disabled')
+            self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
+
         ttk.Button(action_frame, text="Preview",
                    command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 10))
 
@@ -502,6 +520,86 @@ class CommentCollectorApp:
 
         finally:
             self.create_btn.config(state='normal')
+            self.progress_var.set(0)
+            self.update_status()
+
+    def merge_and_save(self):
+        """Merge new annotations directly into the base PDF."""
+        if not PIKEPDF_AVAILABLE:
+            messagebox.showerror("Missing Dependency",
+                "pikepdf is not installed.\n\n"
+                "Please open Command Prompt and run:\n"
+                "pip install pikepdf\n\n"
+                "Then restart this application.")
+            return
+
+        if not self.base_file or not self.other_files:
+            messagebox.showwarning("Missing Files",
+                "Please select a base PDF and at least one other PDF.")
+            return
+
+        # Suggest output filename
+        base_dir = os.path.dirname(self.base_file)
+        base_name = os.path.splitext(os.path.basename(self.base_file))[0]
+        default_output = f"{base_name}_merged.pdf"
+
+        save_path = filedialog.asksaveasfilename(
+            title="Save Merged PDF",
+            defaultextension=".pdf",
+            initialdir=base_dir,
+            initialfile=default_output,
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not save_path:
+            return
+
+        # Warn if overwriting base file
+        if os.path.normpath(save_path) == os.path.normpath(self.base_file):
+            if not messagebox.askyesno("Confirm Overwrite",
+                "You are about to overwrite the base PDF.\n\n"
+                "Are you sure you want to continue?\n\n"
+                "(A backup is recommended)"):
+                return
+
+        self.create_btn.config(state='disabled')
+        if hasattr(self, 'merge_btn'):
+            self.merge_btn.config(state='disabled')
+        self.progress_var.set(0)
+
+        try:
+            self.status_var.set("Reading PDFs...")
+            self.root.update()
+
+            base_annots, all_new = self.collect_new_annotations()
+
+            if not all_new:
+                messagebox.showinfo("No New Comments",
+                    "No new comments were found.\n"
+                    "All comments already exist in the base PDF.")
+                return
+
+            self.status_var.set(f"Merging {len(all_new)} annotations...")
+            self.progress_var.set(90)
+            self.root.update()
+
+            # Use pikepdf to merge annotations directly
+            count = import_annotations_direct(self.base_file, all_new, save_path)
+
+            self.progress_var.set(100)
+            self.status_var.set("Merge complete!")
+
+            messagebox.showinfo("Success",
+                f"Merged {count} new comment(s) into PDF.\n\n"
+                f"Saved to:\n{save_path}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to merge:\n\n{e}")
+            self.status_var.set("Merge failed")
+
+        finally:
+            self.create_btn.config(state='normal')
+            if hasattr(self, 'merge_btn'):
+                self.merge_btn.config(state='normal')
             self.progress_var.set(0)
             self.update_status()
 

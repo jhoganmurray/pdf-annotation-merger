@@ -42,11 +42,13 @@ except ImportError:
 
 # Optional: pikepdf for direct PDF merging
 PIKEPDF_AVAILABLE = False
+PIKEPDF_ERROR = None
 try:
+    import pikepdf
     from xfdf_importer import import_annotations_direct
     PIKEPDF_AVAILABLE = True
-except ImportError:
-    pass
+except ImportError as e:
+    PIKEPDF_ERROR = str(e)
 
 
 # =============================================================================
@@ -335,16 +337,10 @@ class CommentCollectorApp:
                                       command=self.create_xfdf)
         self.create_btn.pack(side=tk.RIGHT)
 
-        # Import to Base button (only if pikepdf available)
-        if PIKEPDF_AVAILABLE:
-            self.merge_btn = ttk.Button(action_frame, text="Import to Base",
-                                         command=self.merge_and_save)
-            self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
-        else:
-            # Show disabled button with tooltip-style label
-            self.merge_btn = ttk.Button(action_frame, text="Import to Base",
-                                         state='disabled')
-            self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
+        # Import to Base button (attempts install if pikepdf missing)
+        self.merge_btn = ttk.Button(action_frame, text="Import to Base",
+                                     command=self.merge_and_save)
+        self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
 
         ttk.Button(action_frame, text="Preview",
                    command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 10))
@@ -525,13 +521,39 @@ class CommentCollectorApp:
 
     def merge_and_save(self):
         """Merge new annotations directly into the base PDF."""
+        global PIKEPDF_AVAILABLE, PIKEPDF_ERROR, import_annotations_direct
+
         if not PIKEPDF_AVAILABLE:
-            messagebox.showerror("Missing Dependency",
-                "pikepdf is not installed.\n\n"
-                "Please open Command Prompt and run:\n"
-                "pip install pikepdf\n\n"
-                "Then restart this application.")
-            return
+            # Offer to install pikepdf
+            result = messagebox.askyesno("Install Required",
+                f"pikepdf is required for direct PDF import.\n\n"
+                f"Error: {PIKEPDF_ERROR}\n\n"
+                "Would you like to install it now?\n"
+                "(This may take a moment)")
+
+            if result:
+                self.status_var.set("Installing pikepdf...")
+                self.root.update()
+
+                import subprocess
+                try:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "pikepdf"],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # Try importing again
+                    import pikepdf
+                    from xfdf_importer import import_annotations_direct
+                    PIKEPDF_AVAILABLE = True
+                    PIKEPDF_ERROR = None
+                    self.status_var.set("pikepdf installed successfully!")
+                    messagebox.showinfo("Success", "pikepdf installed. You can now use Import to Base.")
+                except Exception as e:
+                    self.status_var.set("Installation failed")
+                    messagebox.showerror("Installation Failed",
+                        f"Could not install pikepdf:\n\n{e}\n\n"
+                        "Please run manually:\npip install pikepdf")
+                    return
+            else:
+                return
 
         if not self.base_file or not self.other_files:
             messagebox.showwarning("Missing Files",

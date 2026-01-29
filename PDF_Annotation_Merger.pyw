@@ -16,6 +16,8 @@ Usage:
 import os
 import sys
 import datetime
+import tempfile
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Tuple, Set
@@ -59,6 +61,66 @@ class AnnotationKey:
 def round_rect(rect, precision=1) -> Tuple[float, float, float, float]:
     """Round rectangle coordinates for comparison"""
     return tuple(round(x, precision) for x in rect)
+
+
+def repair_pdf(input_path: str, temp_dir: str) -> str:
+    """
+    Repair a PDF by opening and re-saving it with cleanup options.
+    This fixes xref table issues common in OneDrive-edited PDFs.
+    Returns path to the repaired temporary file.
+    """
+    import io
+
+    # Create a temp file path
+    base_name = os.path.basename(input_path)
+    temp_path = os.path.join(temp_dir, f"repaired_{base_name}")
+
+    # Suppress MuPDF warnings during open/save (xref errors are recoverable)
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+
+    try:
+        # Open the document - MuPDF will attempt to repair on open
+        doc = fitz.open(input_path)
+        # Save with all cleanup options
+        doc.save(temp_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+    except Exception as e:
+        # If repair fails, try copying the original and working with it directly
+        sys.stderr = old_stderr
+        error_msg = str(e).lower()
+        # Only re-raise if it's not a recoverable xref error
+        if "xref" not in error_msg and "object" not in error_msg:
+            raise
+        # For xref errors, just copy the file and hope for the best
+        shutil.copy2(input_path, temp_path)
+    finally:
+        sys.stderr = old_stderr
+
+    return temp_path
+
+
+def open_pdf_safe(filepath: str):
+    """Open a PDF file, suppressing recoverable MuPDF warnings."""
+    import io
+
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+
+    try:
+        doc = fitz.open(filepath)
+    except Exception as e:
+        sys.stderr = old_stderr
+        error_msg = str(e).lower()
+        # Re-raise if it's not a recoverable error
+        if "xref" not in error_msg and "object" not in error_msg:
+            raise
+        # Try opening again without stderr suppression
+        doc = fitz.open(filepath)
+    finally:
+        sys.stderr = old_stderr
+
+    return doc
 
 
 def extract_annotation_keys(doc) -> dict:
@@ -437,61 +499,83 @@ class PDFMergerApp:
         output_path = os.path.join(script_dir, output_filename)
         stats['output_path'] = output_path
 
-        # Open base document
-        base_doc = fitz.open(self.selected_files[0])
-        base_keys = extract_annotation_keys(base_doc)
-        stats['base_annotations'] = len(base_keys)
+        # Create temp directory for repaired PDFs
+        temp_dir = tempfile.mkdtemp(prefix="pdf_merger_")
 
-        all_seen_keys: Set[AnnotationKey] = set(base_keys.keys())
+        try:
+            total_files = len(self.selected_files)
 
-        total_files = len(self.selected_files)
+            # Repair base document first
+            self.status_var.set("Repairing PDF 1 of {}...".format(total_files))
+            self.root.update()
+            repaired_base = repair_pdf(self.selected_files[0], temp_dir)
 
-        # Process each additional file
-        for file_idx, input_path in enumerate(self.selected_files[1:], start=2):
-            # Update progress
-            progress = (file_idx - 1) / total_files * 100
-            self.progress_var.set(progress)
-            self.status_var.set(f"Processing file {file_idx} of {total_files}...")
+            # Open repaired base document
+            base_doc = open_pdf_safe(repaired_base)
+            base_keys = extract_annotation_keys(base_doc)
+            stats['base_annotations'] = len(base_keys)
+
+            all_seen_keys: Set[AnnotationKey] = set(base_keys.keys())
+
+            # Process each additional file
+            for file_idx, input_path in enumerate(self.selected_files[1:], start=2):
+                # Update progress
+                progress = (file_idx - 1) / total_files * 100
+                self.progress_var.set(progress)
+                self.status_var.set(f"Repairing PDF {file_idx} of {total_files}...")
+                self.root.update()
+
+                # Repair the source PDF
+                repaired_source = repair_pdf(input_path, temp_dir)
+
+                self.status_var.set(f"Processing file {file_idx} of {total_files}...")
+                self.root.update()
+
+                source_doc = open_pdf_safe(repaired_source)
+                source_keys = extract_annotation_keys(source_doc)
+
+                # Find unique annotations
+                unique_keys = set(source_keys.keys()) - all_seen_keys
+
+                # Copy unique annotations
+                for page_num in range(source_doc.page_count):
+                    source_page = source_doc[page_num]
+                    target_page = base_doc[page_num]
+
+                    annots = list(source_page.annots()) if source_page.annots() else []
+
+                    for annot in annots:
+                        info = annot.info
+                        key = AnnotationKey(
+                            page=page_num,
+                            annot_type=annot.type[1],
+                            rect=round_rect(annot.rect),
+                            content=info.get('content', '') or ''
+                        )
+
+                        if key in unique_keys:
+                            if copy_annotation(source_page, target_page, annot):
+                                stats['merged_annotations'] += 1
+                                all_seen_keys.add(key)
+                            else:
+                                stats['failed_annotations'] += 1
+
+                stats['duplicate_annotations'] += len(source_keys) - len(unique_keys)
+                source_doc.close()
+
+            # Save merged document
+            self.status_var.set("Saving merged document...")
             self.root.update()
 
-            source_doc = fitz.open(input_path)
-            source_keys = extract_annotation_keys(source_doc)
+            base_doc.save(output_path, garbage=4, deflate=True, clean=True)
+            base_doc.close()
 
-            # Find unique annotations
-            unique_keys = set(source_keys.keys()) - all_seen_keys
-
-            # Copy unique annotations
-            for page_num in range(source_doc.page_count):
-                source_page = source_doc[page_num]
-                target_page = base_doc[page_num]
-
-                annots = list(source_page.annots()) if source_page.annots() else []
-
-                for annot in annots:
-                    info = annot.info
-                    key = AnnotationKey(
-                        page=page_num,
-                        annot_type=annot.type[1],
-                        rect=round_rect(annot.rect),
-                        content=info.get('content', '') or ''
-                    )
-
-                    if key in unique_keys:
-                        if copy_annotation(source_page, target_page, annot):
-                            stats['merged_annotations'] += 1
-                            all_seen_keys.add(key)
-                        else:
-                            stats['failed_annotations'] += 1
-
-            stats['duplicate_annotations'] += len(source_keys) - len(unique_keys)
-            source_doc.close()
-
-        # Save merged document
-        self.status_var.set("Saving merged document...")
-        self.root.update()
-
-        base_doc.save(output_path, garbage=4, deflate=True)
-        base_doc.close()
+        finally:
+            # Clean up temp directory
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
 
         return stats
 

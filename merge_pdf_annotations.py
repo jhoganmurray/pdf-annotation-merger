@@ -16,6 +16,9 @@ files are merged into it.
 import fitz  # PyMuPDF
 import sys
 import os
+import io
+import tempfile
+import shutil
 from typing import List, Dict, Tuple, Set
 from dataclasses import dataclass
 from copy import deepcopy
@@ -42,6 +45,37 @@ class AnnotationKey:
 def round_rect(rect, precision=1) -> Tuple[float, float, float, float]:
     """Round rectangle coordinates for comparison (handles minor float differences)"""
     return tuple(round(x, precision) for x in rect)
+
+
+def repair_pdf(input_path: str, temp_dir: str) -> str:
+    """
+    Repair a PDF by opening and re-saving it with cleanup options.
+    This fixes xref table issues common in OneDrive-edited PDFs.
+    """
+    base_name = os.path.basename(input_path)
+    temp_path = os.path.join(temp_dir, f"repaired_{base_name}")
+
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        doc = fitz.open(input_path)
+        doc.save(temp_path, garbage=4, deflate=True, clean=True)
+        doc.close()
+    finally:
+        sys.stderr = old_stderr
+
+    return temp_path
+
+
+def open_pdf_safe(filepath: str):
+    """Open a PDF file, suppressing recoverable MuPDF warnings."""
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        doc = fitz.open(filepath)
+    finally:
+        sys.stderr = old_stderr
+    return doc
 
 
 def extract_annotation_keys(doc: fitz.Document) -> Dict[AnnotationKey, dict]:
@@ -227,78 +261,95 @@ def merge_pdf_annotations(output_path: str, input_paths: List[str], verbose: boo
         'files_processed': len(input_paths),
     }
 
-    # Open the base document (first file)
-    base_path = input_paths[0]
-    if verbose:
-        print(f"Using base file: {os.path.basename(base_path)}")
+    # Create temp directory for repaired PDFs
+    temp_dir = tempfile.mkdtemp(prefix="pdf_merger_")
 
-    base_doc = fitz.open(base_path)
-    base_keys = extract_annotation_keys(base_doc)
-    stats['base_annotations'] = len(base_keys)
-
-    if verbose:
-        print(f"  Base annotations: {len(base_keys)}")
-
-    # Track all annotations we've seen
-    all_seen_keys: Set[AnnotationKey] = set(base_keys.keys())
-
-    # Process each additional file
-    for input_path in input_paths[1:]:
+    try:
+        # Repair and open the base document (first file)
+        base_path = input_paths[0]
         if verbose:
-            print(f"\nProcessing: {os.path.basename(input_path)}")
+            print(f"Repairing base file: {os.path.basename(base_path)}")
 
-        source_doc = fitz.open(input_path)
-        source_keys = extract_annotation_keys(source_doc)
+        repaired_base = repair_pdf(base_path, temp_dir)
+        base_doc = open_pdf_safe(repaired_base)
+        base_keys = extract_annotation_keys(base_doc)
+        stats['base_annotations'] = len(base_keys)
 
         if verbose:
-            print(f"  Total annotations: {len(source_keys)}")
+            print(f"  Base annotations: {len(base_keys)}")
 
-        # Find annotations unique to this file
-        unique_keys = set(source_keys.keys()) - all_seen_keys
+        # Track all annotations we've seen
+        all_seen_keys: Set[AnnotationKey] = set(base_keys.keys())
 
+        # Process each additional file
+        for input_path in input_paths[1:]:
+            if verbose:
+                print(f"\nRepairing: {os.path.basename(input_path)}")
+
+            repaired_source = repair_pdf(input_path, temp_dir)
+
+            if verbose:
+                print(f"Processing: {os.path.basename(input_path)}")
+
+            source_doc = open_pdf_safe(repaired_source)
+            source_keys = extract_annotation_keys(source_doc)
+
+            if verbose:
+                print(f"  Total annotations: {len(source_keys)}")
+
+            # Find annotations unique to this file
+            unique_keys = set(source_keys.keys()) - all_seen_keys
+
+            if verbose:
+                print(f"  Unique annotations to merge: {len(unique_keys)}")
+
+            # Copy unique annotations to base document
+            merged_count = 0
+            failed_count = 0
+
+            for page_num in range(source_doc.page_count):
+                source_page = source_doc[page_num]
+                target_page = base_doc[page_num]
+
+                annots = list(source_page.annots()) if source_page.annots() else []
+
+                for annot in annots:
+                    info = annot.info
+                    key = AnnotationKey(
+                        page=page_num,
+                        annot_type=annot.type[1],
+                        rect=round_rect(annot.rect),
+                        content=info.get('content', '') or ''
+                    )
+
+                    if key in unique_keys:
+                        if copy_annotation(source_page, target_page, annot):
+                            merged_count += 1
+                            all_seen_keys.add(key)
+                            if verbose:
+                                content_preview = key.content[:30] + "..." if len(key.content) > 30 else key.content
+                                print(f"    + Page {page_num + 1}: {key.annot_type} - {content_preview or '(drawing)'}")
+                        else:
+                            failed_count += 1
+
+            source_doc.close()
+            stats['merged_annotations'] += merged_count
+            stats['failed_annotations'] += failed_count
+            stats['duplicate_annotations'] += len(source_keys) - len(unique_keys)
+
+        # Save the merged document
         if verbose:
-            print(f"  Unique annotations to merge: {len(unique_keys)}")
+            print(f"\nSaving merged document: {output_path}")
 
-        # Copy unique annotations to base document
-        merged_count = 0
-        failed_count = 0
+        base_doc.save(output_path, garbage=4, deflate=True, clean=True)
+        base_doc.close()
 
-        for page_num in range(source_doc.page_count):
-            source_page = source_doc[page_num]
-            target_page = base_doc[page_num]
-
-            annots = list(source_page.annots()) if source_page.annots() else []
-
-            for annot in annots:
-                info = annot.info
-                key = AnnotationKey(
-                    page=page_num,
-                    annot_type=annot.type[1],
-                    rect=round_rect(annot.rect),
-                    content=info.get('content', '') or ''
-                )
-
-                if key in unique_keys:
-                    if copy_annotation(source_page, target_page, annot):
-                        merged_count += 1
-                        all_seen_keys.add(key)
-                        if verbose:
-                            content_preview = key.content[:30] + "..." if len(key.content) > 30 else key.content
-                            print(f"    + Page {page_num + 1}: {key.annot_type} - {content_preview or '(drawing)'}")
-                    else:
-                        failed_count += 1
-
-        source_doc.close()
-        stats['merged_annotations'] += merged_count
-        stats['failed_annotations'] += failed_count
-        stats['duplicate_annotations'] += len(source_keys) - len(unique_keys)
-
-    # Save the merged document
-    if verbose:
-        print(f"\nSaving merged document: {output_path}")
-
-    base_doc.save(output_path, garbage=4, deflate=True)
-    base_doc.close()
+    finally:
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
 
     if verbose:
         print("\n" + "=" * 50)

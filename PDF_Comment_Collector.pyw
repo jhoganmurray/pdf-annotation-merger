@@ -335,14 +335,14 @@ class CommentCollectorApp:
                                       command=self.create_xfdf)
         self.create_btn.pack(side=tk.RIGHT)
 
-        # Merge & Save button (only if pikepdf available)
+        # Import to Base button (only if pikepdf available)
         if PIKEPDF_AVAILABLE:
-            self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
+            self.merge_btn = ttk.Button(action_frame, text="Import to Base",
                                          command=self.merge_and_save)
             self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
         else:
             # Show disabled button with tooltip-style label
-            self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
+            self.merge_btn = ttk.Button(action_frame, text="Import to Base",
                                          state='disabled')
             self.merge_btn.pack(side=tk.RIGHT, padx=(0, 10))
 

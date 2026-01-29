@@ -44,6 +44,14 @@ except ImportError:
     )
     sys.exit(1)
 
+# Check for win32com (optional - for Acrobat automation)
+ACROBAT_AVAILABLE = False
+try:
+    import win32com.client
+    ACROBAT_AVAILABLE = True
+except ImportError:
+    pass
+
 
 # =============================================================================
 # ANNOTATION EXTRACTION
@@ -121,6 +129,76 @@ def find_new_annotations(base_annots: List[Dict], other_annots: List[Dict]) -> L
     """Find annotations in 'other' that don't exist in 'base'."""
     base_keys = {a['_key'] for a in base_annots}
     return [a for a in other_annots if a['_key'] not in base_keys]
+
+
+# =============================================================================
+# ACROBAT AUTOMATION (Windows only)
+# =============================================================================
+
+def check_acrobat_available() -> bool:
+    """Check if Adobe Acrobat is available for automation."""
+    if not ACROBAT_AVAILABLE:
+        return False
+    try:
+        # Try to create Acrobat objects
+        win32com.client.Dispatch("AcroExch.App")
+        return True
+    except:
+        return False
+
+
+def import_xfdf_with_acrobat(pdf_path: str, xfdf_path: str, output_path: str) -> bool:
+    """
+    Use Adobe Acrobat to import XFDF comments into a PDF.
+    Requires Adobe Acrobat Pro to be installed.
+
+    Returns True on success, raises exception on failure.
+    """
+    if not ACROBAT_AVAILABLE:
+        raise Exception("pywin32 is not installed. Run: pip install pywin32")
+
+    acrobat = None
+    av_doc = None
+
+    try:
+        # Start Acrobat (hidden)
+        acrobat = win32com.client.Dispatch("AcroExch.App")
+        acrobat.Hide()  # Run in background
+
+        # Open the PDF
+        av_doc = win32com.client.Dispatch("AcroExch.AVDoc")
+        if not av_doc.Open(pdf_path, ""):
+            raise Exception(f"Failed to open PDF: {pdf_path}")
+
+        # Get the PDDoc and JavaScript object
+        pd_doc = av_doc.GetPDDoc()
+        js_obj = pd_doc.GetJSObject()
+
+        # Import the XFDF using Acrobat's JavaScript API
+        # importAnXFDF is the method for XFDF files
+        js_obj.importAnXFDF(xfdf_path)
+
+        # Save to output path
+        # PDSaveFull = 1, PDSaveLinearized = 4
+        if output_path.lower() != pdf_path.lower():
+            pd_doc.Save(1, output_path)
+        else:
+            pd_doc.Save(1, output_path)
+
+        return True
+
+    finally:
+        # Clean up
+        try:
+            if av_doc:
+                av_doc.Close(True)
+        except:
+            pass
+        try:
+            if acrobat:
+                acrobat.Exit()
+        except:
+            pass
 
 
 # =============================================================================
@@ -375,12 +453,17 @@ class CommentCollectorApp:
         action_frame = ttk.Frame(main)
         action_frame.grid(row=6, column=0, sticky="ew")
 
-        self.create_btn = ttk.Button(action_frame, text="Create XFDF File",
-                                      command=self.create_xfdf)
-        self.create_btn.pack(side=tk.RIGHT)
+        # Merge button (uses Acrobat) - only show if Acrobat might be available
+        self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
+                                     command=self.merge_and_save)
+        self.merge_btn.pack(side=tk.RIGHT)
 
-        ttk.Button(action_frame, text="Preview Changes",
-                   command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 10))
+        self.create_btn = ttk.Button(action_frame, text="Create XFDF Only",
+                                      command=self.create_xfdf)
+        self.create_btn.pack(side=tk.RIGHT, padx=(0, 5))
+
+        ttk.Button(action_frame, text="Preview",
+                   command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 5))
 
     def select_base(self):
         filepath = filedialog.askopenfilename(
@@ -430,6 +513,7 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
+        self.merge_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
@@ -491,6 +575,7 @@ class CommentCollectorApp:
 
         finally:
             self.create_btn.config(state='normal')
+            self.merge_btn.config(state='normal')
             self.progress_var.set(0)
             self.update_status()
 
@@ -513,6 +598,7 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
+        self.merge_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
@@ -569,6 +655,134 @@ class CommentCollectorApp:
             self.status_var.set("Failed to create XFDF")
 
         finally:
+            self.create_btn.config(state='normal')
+            self.merge_btn.config(state='normal')
+            self.progress_var.set(0)
+
+    def merge_and_save(self):
+        """Create XFDF and automatically import it into the PDF using Acrobat."""
+        if not self.base_file or not self.other_files:
+            messagebox.showwarning("Missing Files",
+                "Please select a base PDF and at least one other PDF.")
+            return
+
+        # Check if Acrobat automation is available
+        if not ACROBAT_AVAILABLE:
+            result = messagebox.askyesno(
+                "Acrobat Automation Not Available",
+                "Automatic PDF merging requires pywin32.\n\n"
+                "To enable this feature, run:\n"
+                "pip install pywin32\n\n"
+                "Would you like to create an XFDF file instead?\n"
+                "(You can import it manually in Acrobat)"
+            )
+            if result:
+                self.create_xfdf()
+            return
+
+        if not check_acrobat_available():
+            result = messagebox.askyesno(
+                "Adobe Acrobat Not Found",
+                "Adobe Acrobat Pro is required for automatic merging.\n\n"
+                "Make sure Acrobat Pro (not Reader) is installed.\n\n"
+                "Would you like to create an XFDF file instead?\n"
+                "(You can import it manually in Acrobat)"
+            )
+            if result:
+                self.create_xfdf()
+            return
+
+        # Ask where to save the merged PDF
+        default_name = os.path.splitext(os.path.basename(self.base_file))[0]
+        save_path = filedialog.asksaveasfilename(
+            title="Save Merged PDF",
+            defaultextension=".pdf",
+            initialfile=f"{default_name}_MERGED.pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not save_path:
+            return
+
+        self.merge_btn.config(state='disabled')
+        self.create_btn.config(state='disabled')
+        self.progress_var.set(0)
+
+        # Create a temp file for the XFDF
+        import tempfile
+        temp_xfdf = None
+
+        try:
+            # Phase 1: Extract annotations
+            self.status_var.set("Reading base PDF...")
+            self.root.update()
+            base_annots = extract_annotations(self.base_file)
+
+            all_new = []
+            seen_keys = {a['_key'] for a in base_annots}
+
+            for i, filepath in enumerate(self.other_files):
+                self.status_var.set(f"Reading file {i+1} of {len(self.other_files)}...")
+                self.progress_var.set((i + 1) / (len(self.other_files) + 2) * 60)
+                self.root.update()
+
+                other_annots = extract_annotations(filepath)
+                for a in other_annots:
+                    if a['_key'] not in seen_keys:
+                        all_new.append(a)
+                        seen_keys.add(a['_key'])
+
+            if not all_new:
+                messagebox.showinfo("No New Comments",
+                    "No new comments were found in the other files.\n"
+                    "All comments already exist in the base PDF.")
+                return
+
+            # Phase 2: Create temporary XFDF
+            self.status_var.set("Creating XFDF...")
+            self.progress_var.set(70)
+            self.root.update()
+
+            xfdf_content = create_xfdf(all_new, os.path.basename(self.base_file))
+
+            # Write to temp file
+            temp_fd, temp_xfdf = tempfile.mkstemp(suffix='.xfdf')
+            os.close(temp_fd)
+            with open(temp_xfdf, 'w', encoding='utf-8') as f:
+                f.write(xfdf_content)
+
+            # Phase 3: Use Acrobat to import
+            self.status_var.set("Importing comments via Adobe Acrobat...")
+            self.progress_var.set(85)
+            self.root.update()
+
+            # Copy base PDF to output location first
+            import shutil
+            shutil.copy2(self.base_file, save_path)
+
+            # Import XFDF into the copy
+            import_xfdf_with_acrobat(save_path, temp_xfdf, save_path)
+
+            self.progress_var.set(100)
+            self.status_var.set("Merge complete!")
+
+            messagebox.showinfo("Success",
+                f"Successfully merged {len(all_new)} new comment(s)!\n\n"
+                f"Saved to:\n{save_path}")
+
+        except Exception as e:
+            messagebox.showerror("Merge Failed",
+                f"Failed to merge PDF:\n\n{str(e)}\n\n"
+                "Try using 'Create XFDF Only' and import manually in Acrobat.")
+            self.status_var.set("Merge failed")
+
+        finally:
+            # Clean up temp file
+            if temp_xfdf and os.path.exists(temp_xfdf):
+                try:
+                    os.remove(temp_xfdf)
+                except:
+                    pass
+            self.merge_btn.config(state='normal')
             self.create_btn.config(state='normal')
             self.progress_var.set(0)
 

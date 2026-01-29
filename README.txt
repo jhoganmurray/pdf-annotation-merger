@@ -45,7 +45,11 @@ REQUIREMENTS
 - Windows 10 or later
 - Python 3.8+ (https://www.python.org/downloads/)
   * Check "Add Python to PATH" during installation
-- Adobe Acrobat (Pro recommended) for importing the XFDF
+- Adobe Acrobat Pro (for importing XFDF or automatic merge)
+
+Optional (for automatic "Merge & Save PDF" button):
+- pywin32: pip install pywin32
+  This allows the tool to automatically import comments via Acrobat
 
 
 FILES INCLUDED

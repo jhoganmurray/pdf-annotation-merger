@@ -32,6 +32,14 @@ if errorlevel 1 (
     echo.
 )
 
+REM Check for pywin32 (optional - enables automatic merge)
+python -c "import win32com.client" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo Optional: Installing pywin32 for automatic Acrobat integration...
+    pip install pywin32 >nul 2>&1
+)
+
 REM Run the application
 echo Starting PDF Comment Collector...
 pythonw "%~dp0PDF_Comment_Collector.pyw"

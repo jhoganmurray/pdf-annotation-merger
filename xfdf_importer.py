@@ -297,26 +297,26 @@ def import_xfdf_to_pdf(
 
         page = pdf.pages[page_num]
 
-        # Get or create Annots array
+        # Get existing annots array, handling indirect references
+        annots_array = []
         if Name.Annots in page:
-            annots_array = page[Name.Annots]
-            # Handle indirect reference
-            if isinstance(annots_array, pikepdf.Object):
-                annots_array = list(annots_array)
-            else:
-                annots_array = list(annots_array)
-        else:
-            annots_array = []
+            existing = page[Name.Annots]
+            try:
+                for item in existing:
+                    annots_array.append(item)
+            except TypeError:
+                pass
 
         # Add each annotation
         for annot_data in page_annots:
             annot_dict = create_annotation_dict(annot_data)
 
-            # Add page reference (P entry)
-            annot_dict[Name.P] = page.obj
-
-            # Create indirect object for annotation
+            # Create indirect object for annotation first
             annot_obj = pdf.make_indirect(annot_dict)
+
+            # Add page reference after making indirect
+            annot_obj[Name.P] = page.obj
+
             annots_array.append(annot_obj)
             imported_count += 1
 
@@ -373,23 +373,40 @@ def import_annotations_direct(
             continue
 
         page = pdf.pages[page_num]
-        page_height = float(page.mediabox[3]) - float(page.mediabox[1])
 
-        # Get existing annots
-        if Name.Annots in page:
-            annots_array = list(page[Name.Annots])
+        # Get page height from MediaBox
+        mediabox = page.get(Name.MediaBox)
+        if mediabox is not None:
+            page_height = float(mediabox[3]) - float(mediabox[1])
         else:
-            annots_array = []
+            page_height = 792.0  # Default letter size
+
+        # Get existing annots array, handling indirect references
+        annots_array = []
+        if Name.Annots in page:
+            existing = page[Name.Annots]
+            # Iterate through existing annotations
+            try:
+                for item in existing:
+                    annots_array.append(item)
+            except TypeError:
+                # If not iterable, it might be a single annotation or invalid
+                pass
 
         for annot_data in page_annots:
             # Convert from PyMuPDF format to PDF format
             pdf_annot = convert_pymupdf_to_pdf_annot(annot_data, page_height)
-            pdf_annot[Name.P] = page.obj
 
+            # Create indirect object for annotation first (without P reference)
             annot_obj = pdf.make_indirect(pdf_annot)
+
+            # Now add page reference to the indirect object
+            annot_obj[Name.P] = page.obj
+
             annots_array.append(annot_obj)
             imported_count += 1
 
+        # Set the new Annots array
         page[Name.Annots] = Array(annots_array)
 
     pdf.save(output_path)

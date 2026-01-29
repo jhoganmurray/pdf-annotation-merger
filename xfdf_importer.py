@@ -311,11 +311,10 @@ def import_xfdf_to_pdf(
         for annot_data in page_annots:
             annot_dict = create_annotation_dict(annot_data)
 
-            # Create indirect object for annotation first
+            # Create indirect object for annotation
             annot_obj = pdf.make_indirect(annot_dict)
 
-            # Add page reference after making indirect
-            annot_obj[Name.P] = page.obj
+            # Note: P (page reference) is optional, skipping to avoid compatibility issues
 
             annots_array.append(annot_obj)
             imported_count += 1
@@ -397,11 +396,11 @@ def import_annotations_direct(
             # Convert from PyMuPDF format to PDF format
             pdf_annot = convert_pymupdf_to_pdf_annot(annot_data, page_height)
 
-            # Create indirect object for annotation first (without P reference)
+            # Create indirect object for annotation
             annot_obj = pdf.make_indirect(pdf_annot)
 
-            # Now add page reference to the indirect object
-            annot_obj[Name.P] = page.obj
+            # Note: P (page reference) is optional and can cause issues, skipping it
+            # Most PDF readers derive the page from the Annots array location
 
             annots_array.append(annot_obj)
             imported_count += 1

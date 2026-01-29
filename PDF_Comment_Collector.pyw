@@ -615,7 +615,9 @@ class CommentCollectorApp:
                 f"Saved to:\n{save_path}")
 
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to merge:\n\n{e}")
+            import traceback
+            error_details = traceback.format_exc()
+            messagebox.showerror("Error", f"Failed to merge:\n\n{e}\n\nDetails:\n{error_details}")
             self.status_var.set("Merge failed")
 
         finally:

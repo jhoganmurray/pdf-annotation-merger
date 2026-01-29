@@ -453,10 +453,10 @@ class CommentCollectorApp:
         action_frame = ttk.Frame(main)
         action_frame.grid(row=6, column=0, sticky="ew")
 
-        # Merge button (uses Acrobat) - only show if Acrobat might be available
-        self.merge_btn = ttk.Button(action_frame, text="Merge && Save PDF",
-                                     command=self.merge_and_save)
-        self.merge_btn.pack(side=tk.RIGHT)
+        # Import button (uses Acrobat) - only show if Acrobat might be available
+        self.import_btn = ttk.Button(action_frame, text="Import && Save PDF",
+                                     command=self.import_and_save)
+        self.import_btn.pack(side=tk.RIGHT)
 
         self.create_btn = ttk.Button(action_frame, text="Create XFDF Only",
                                       command=self.create_xfdf)
@@ -513,7 +513,7 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
-        self.merge_btn.config(state='disabled')
+        self.import_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
@@ -575,7 +575,7 @@ class CommentCollectorApp:
 
         finally:
             self.create_btn.config(state='normal')
-            self.merge_btn.config(state='normal')
+            self.import_btn.config(state='normal')
             self.progress_var.set(0)
             self.update_status()
 
@@ -598,7 +598,7 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
-        self.merge_btn.config(state='disabled')
+        self.import_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
@@ -656,10 +656,10 @@ class CommentCollectorApp:
 
         finally:
             self.create_btn.config(state='normal')
-            self.merge_btn.config(state='normal')
+            self.import_btn.config(state='normal')
             self.progress_var.set(0)
 
-    def merge_and_save(self):
+    def import_and_save(self):
         """Create XFDF and automatically import it into the PDF using Acrobat."""
         if not self.base_file or not self.other_files:
             messagebox.showwarning("Missing Files",
@@ -683,7 +683,7 @@ class CommentCollectorApp:
         if not check_acrobat_available():
             result = messagebox.askyesno(
                 "Adobe Acrobat Not Found",
-                "Adobe Acrobat Pro is required for automatic merging.\n\n"
+                "Adobe Acrobat Pro is required for automatic import.\n\n"
                 "Make sure Acrobat Pro (not Reader) is installed.\n\n"
                 "Would you like to create an XFDF file instead?\n"
                 "(You can import it manually in Acrobat)"
@@ -695,15 +695,15 @@ class CommentCollectorApp:
         # Ask where to save the merged PDF
         default_name = os.path.splitext(os.path.basename(self.base_file))[0]
         save_path = filedialog.asksaveasfilename(
-            title="Save Merged PDF",
+            title="Save Output PDF",
             defaultextension=".pdf",
-            initialfile=f"{default_name}_MERGED.pdf",
+            initialfile=f"{default_name}_with_imports.pdf",
             filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
         )
         if not save_path:
             return
 
-        self.merge_btn.config(state='disabled')
+        self.import_btn.config(state='disabled')
         self.create_btn.config(state='disabled')
         self.progress_var.set(0)
 
@@ -763,17 +763,17 @@ class CommentCollectorApp:
             import_xfdf_with_acrobat(save_path, temp_xfdf, save_path)
 
             self.progress_var.set(100)
-            self.status_var.set("Merge complete!")
+            self.status_var.set("Import complete!")
 
             messagebox.showinfo("Success",
-                f"Successfully merged {len(all_new)} new comment(s)!\n\n"
+                f"Successfully imported {len(all_new)} new comment(s)!\n\n"
                 f"Saved to:\n{save_path}")
 
         except Exception as e:
-            messagebox.showerror("Merge Failed",
-                f"Failed to merge PDF:\n\n{str(e)}\n\n"
+            messagebox.showerror("Import Failed",
+                f"Failed to import PDF:\n\n{str(e)}\n\n"
                 "Try using 'Create XFDF Only' and import manually in Acrobat.")
-            self.status_var.set("Merge failed")
+            self.status_var.set("Import failed")
 
         finally:
             # Clean up temp file
@@ -782,7 +782,7 @@ class CommentCollectorApp:
                     os.remove(temp_xfdf)
                 except:
                     pass
-            self.merge_btn.config(state='normal')
+            self.import_btn.config(state='normal')
             self.create_btn.config(state='normal')
             self.progress_var.set(0)
 

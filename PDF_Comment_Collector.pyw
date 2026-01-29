@@ -20,16 +20,13 @@ Requirements:
 
 import os
 import sys
-import json
 import hashlib
-import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Dict, Set, Any, Optional
+from typing import List, Dict, Any, Optional
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
-# Check for PyMuPDF
 try:
     import fitz
 except ImportError:
@@ -43,14 +40,6 @@ except ImportError:
         "Then try again."
     )
     sys.exit(1)
-
-# Check for win32com (optional - for Acrobat automation)
-ACROBAT_AVAILABLE = False
-try:
-    import win32com.client
-    ACROBAT_AVAILABLE = True
-except ImportError:
-    pass
 
 
 # =============================================================================
@@ -70,27 +59,18 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
             data = {
                 'page': page_num,
                 'type': annot.type[1],
-                'type_code': annot.type[0],
                 'rect': list(annot.rect),
                 'content': annot.info.get('content', '') or '',
                 'author': annot.info.get('title', '') or '',
                 'subject': annot.info.get('subject', '') or '',
-                'created': annot.info.get('creationDate', '') or '',
-                'modified': annot.info.get('modDate', '') or '',
                 'opacity': annot.opacity if annot.opacity >= 0 else 1.0,
                 'page_height': page_height,
                 'flags': annot.flags,
             }
 
-            # Border style (includes line width)
-            if annot.border:
-                border = annot.border
-                if border.get('width') and border['width'] > 0:
-                    data['border_width'] = border['width']
-                if border.get('dashes'):
-                    data['border_dashes'] = list(border['dashes'])
-                if border.get('style'):
-                    data['border_style'] = border['style']
+            # Border style (line width)
+            if annot.border and annot.border.get('width', 0) > 0:
+                data['border_width'] = annot.border['width']
 
             # Colors
             if annot.colors:
@@ -99,18 +79,11 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
                 if annot.colors.get('fill'):
                     data['fill_color'] = list(annot.colors['fill'])
 
-            # Vertices for various annotation types
+            # Vertices for ink, line, polygon annotations
             if annot.vertices:
                 data['vertices'] = annot.vertices
 
-            # Line endings (for line annotations)
-            if annot.type[0] == fitz.PDF_ANNOT_LINE:
-                try:
-                    data['line_ends'] = annot.line_ends
-                except:
-                    pass
-
-            # Create unique key for deduplication
+            # Unique key for deduplication
             key_parts = [
                 str(page_num),
                 annot.type[1],
@@ -125,82 +98,6 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
     return annotations
 
 
-def find_new_annotations(base_annots: List[Dict], other_annots: List[Dict]) -> List[Dict]:
-    """Find annotations in 'other' that don't exist in 'base'."""
-    base_keys = {a['_key'] for a in base_annots}
-    return [a for a in other_annots if a['_key'] not in base_keys]
-
-
-# =============================================================================
-# ACROBAT AUTOMATION (Windows only)
-# =============================================================================
-
-def check_acrobat_available() -> bool:
-    """Check if Adobe Acrobat is available for automation."""
-    if not ACROBAT_AVAILABLE:
-        return False
-    try:
-        # Try to create Acrobat objects
-        win32com.client.Dispatch("AcroExch.App")
-        return True
-    except:
-        return False
-
-
-def import_xfdf_with_acrobat(pdf_path: str, xfdf_path: str, output_path: str) -> bool:
-    """
-    Use Adobe Acrobat to import XFDF comments into a PDF.
-    Requires Adobe Acrobat Pro to be installed.
-
-    Returns True on success, raises exception on failure.
-    """
-    if not ACROBAT_AVAILABLE:
-        raise Exception("pywin32 is not installed. Run: pip install pywin32")
-
-    acrobat = None
-    av_doc = None
-
-    try:
-        # Start Acrobat (hidden)
-        acrobat = win32com.client.Dispatch("AcroExch.App")
-        acrobat.Hide()  # Run in background
-
-        # Open the PDF
-        av_doc = win32com.client.Dispatch("AcroExch.AVDoc")
-        if not av_doc.Open(pdf_path, ""):
-            raise Exception(f"Failed to open PDF: {pdf_path}")
-
-        # Get the PDDoc and JavaScript object
-        pd_doc = av_doc.GetPDDoc()
-        js_obj = pd_doc.GetJSObject()
-
-        # Import the XFDF using Acrobat's JavaScript API
-        # importAnXFDF is the method for XFDF files
-        js_obj.importAnXFDF(xfdf_path)
-
-        # Save to output path
-        # PDSaveFull = 1, PDSaveLinearized = 4
-        if output_path.lower() != pdf_path.lower():
-            pd_doc.Save(1, output_path)
-        else:
-            pd_doc.Save(1, output_path)
-
-        return True
-
-    finally:
-        # Clean up
-        try:
-            if av_doc:
-                av_doc.Close(True)
-        except:
-            pass
-        try:
-            if acrobat:
-                acrobat.Exit()
-        except:
-            pass
-
-
 # =============================================================================
 # XFDF GENERATION
 # =============================================================================
@@ -208,31 +105,17 @@ def import_xfdf_with_acrobat(pdf_path: str, xfdf_path: str, output_path: str) ->
 def rgb_to_hex(rgb: List[float]) -> str:
     """Convert RGB (0-1 range) to hex color."""
     if not rgb or len(rgb) < 3:
-        return "#FFFF00"  # Default yellow
+        return "#FFFF00"
     r, g, b = [int(c * 255) for c in rgb[:3]]
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
 def rect_to_xfdf(rect: List[float], page_height: float) -> str:
-    """Convert rect to XFDF format (comma-separated, PDF coordinates)."""
-    # XFDF uses PDF coordinates (origin at bottom-left)
-    # PyMuPDF rect is [x0, y0, x1, y1] in top-left origin
-    # Convert: PDF_y = page_height - PyMuPDF_y
+    """Convert rect to XFDF format (PDF coordinates)."""
     x0, y0, x1, y1 = rect
     pdf_y0 = page_height - y1
     pdf_y1 = page_height - y0
     return f"{x0:.2f},{pdf_y0:.2f},{x1:.2f},{pdf_y1:.2f}"
-
-
-def vertices_to_coords(vertices, page_height: float) -> str:
-    """Convert vertices to XFDF coords format."""
-    coords = []
-    for v in vertices:
-        if isinstance(v, (list, tuple)) and len(v) >= 2:
-            x, y = v[0], v[1]
-            pdf_y = page_height - y
-            coords.extend([f"{x:.2f}", f"{pdf_y:.2f}"])
-    return ",".join(coords)
 
 
 def ink_to_gestures(vertices, page_height: float) -> List[str]:
@@ -251,50 +134,44 @@ def ink_to_gestures(vertices, page_height: float) -> List[str]:
     return gestures
 
 
+def vertices_to_coords(vertices, page_height: float) -> str:
+    """Convert vertices to XFDF coords format."""
+    coords = []
+    for v in vertices:
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            x, y = v[0], v[1]
+            pdf_y = page_height - y
+            coords.extend([f"{x:.2f}", f"{pdf_y:.2f}"])
+    return ",".join(coords)
+
+
 def create_xfdf(annotations: List[Dict], base_pdf_name: str) -> str:
     """Create XFDF XML string from annotations."""
-
-    # XFDF namespace
     ns = "http://ns.adobe.com/xfdf/"
     ET.register_namespace('', ns)
 
     root = ET.Element('xfdf', xmlns=ns)
     root.set('xml:space', 'preserve')
 
-    # Reference to the PDF file
     f_elem = ET.SubElement(root, 'f')
     f_elem.set('href', base_pdf_name)
 
-    # Annotations container
     annots = ET.SubElement(root, 'annots')
 
-    # Map PyMuPDF types to XFDF element names
     type_map = {
-        'Text': 'text',
-        'FreeText': 'freetext',
-        'Highlight': 'highlight',
-        'Underline': 'underline',
-        'StrikeOut': 'strikeout',
-        'Squiggly': 'squiggly',
-        'Ink': 'ink',
-        'Line': 'line',
-        'Square': 'square',
-        'Circle': 'circle',
-        'Polygon': 'polygon',
-        'PolyLine': 'polyline',
-        'Stamp': 'stamp',
-        'Caret': 'caret',
-        'FileAttachment': 'fileattachment',
+        'Text': 'text', 'FreeText': 'freetext', 'Highlight': 'highlight',
+        'Underline': 'underline', 'StrikeOut': 'strikeout', 'Squiggly': 'squiggly',
+        'Ink': 'ink', 'Line': 'line', 'Square': 'square', 'Circle': 'circle',
+        'Polygon': 'polygon', 'PolyLine': 'polyline', 'Stamp': 'stamp',
+        'Caret': 'caret', 'FileAttachment': 'fileattachment',
     }
 
     for i, a in enumerate(annotations):
         annot_type = a['type']
         xfdf_type = type_map.get(annot_type, annot_type.lower())
-        page_height = a.get('page_height', 792)  # Default letter size
+        page_height = a.get('page_height', 792)
 
         elem = ET.SubElement(annots, xfdf_type)
-
-        # Common attributes
         elem.set('page', str(a['page']))
         elem.set('rect', rect_to_xfdf(a['rect'], page_height))
         elem.set('name', f"annot_{i}_{a['_key'][:8]}")
@@ -304,31 +181,25 @@ def create_xfdf(annotations: List[Dict], base_pdf_name: str) -> str:
         if color:
             elem.set('color', rgb_to_hex(color))
 
-        # Border width (line thickness)
+        # Line width
         if a.get('border_width'):
             elem.set('width', f"{a['border_width']:.2f}")
+
+        # Opacity
+        if a.get('opacity', 1.0) < 1.0:
+            elem.set('opacity', f"{a['opacity']:.2f}")
 
         # Flags
         if a.get('flags'):
             elem.set('flags', str(a['flags']))
 
-        # Title/Author
+        # Author
         if a.get('author'):
             elem.set('title', a['author'])
 
         # Subject
         if a.get('subject'):
             elem.set('subject', a['subject'])
-
-        # Dates
-        if a.get('created'):
-            elem.set('creationdate', a['created'])
-        if a.get('modified'):
-            elem.set('date', a['modified'])
-
-        # Opacity
-        if a.get('opacity', 1.0) < 1.0:
-            elem.set('opacity', f"{a['opacity']:.2f}")
 
         # Contents
         if a.get('content'):
@@ -359,7 +230,6 @@ def create_xfdf(annotations: List[Dict], base_pdf_name: str) -> str:
             if a.get('vertices'):
                 elem.set('vertices', vertices_to_coords(a['vertices'], page_height))
 
-    # Pretty print
     xml_str = ET.tostring(root, encoding='unicode')
     dom = minidom.parseString(xml_str)
     return dom.toprettyxml(indent="  ", encoding=None)
@@ -373,9 +243,9 @@ class CommentCollectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Comment Collector")
-        self.root.geometry("600x520")
+        self.root.geometry("600x500")
         self.root.resizable(True, True)
-        self.root.minsize(500, 450)
+        self.root.minsize(500, 400)
 
         self.base_file: Optional[str] = None
         self.other_files: List[str] = []
@@ -395,17 +265,18 @@ class CommentCollectorApp:
 
         # Instructions
         instructions = (
-            "This tool finds NEW comments in divergent PDF copies and exports them\n"
+            "Collects NEW comments from divergent PDF copies and exports them\n"
             "as an XFDF file you can import into Adobe Acrobat.\n\n"
             "1. Select your BASE PDF (the master you want to update)\n"
             "2. Select OTHER PDFs (copies with additional comments)\n"
-            "3. Click 'Create XFDF' to generate the import file"
+            "3. Click 'Create XFDF' to generate the import file\n"
+            "4. In Acrobat: Comment → Import Comments → select the XFDF"
         )
         ttk.Label(main, text=instructions, font=('Segoe UI', 9),
                   foreground='gray').grid(row=1, column=0, sticky="w", pady=(5, 15))
 
         # BASE FILE section
-        base_frame = ttk.LabelFrame(main, text="Step 1: Base PDF (your master file)", padding="5")
+        base_frame = ttk.LabelFrame(main, text="Step 1: Base PDF", padding="5")
         base_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         base_frame.columnconfigure(0, weight=1)
 
@@ -417,7 +288,7 @@ class CommentCollectorApp:
                    command=self.select_base).grid(row=0, column=1, padx=(10, 0))
 
         # OTHER FILES section
-        other_frame = ttk.LabelFrame(main, text="Step 2: Other PDFs (copies with new comments)", padding="5")
+        other_frame = ttk.LabelFrame(main, text="Step 2: Other PDFs (with new comments)", padding="5")
         other_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
         other_frame.columnconfigure(0, weight=1)
         other_frame.rowconfigure(0, weight=1)
@@ -453,17 +324,12 @@ class CommentCollectorApp:
         action_frame = ttk.Frame(main)
         action_frame.grid(row=6, column=0, sticky="ew")
 
-        # Import button (uses Acrobat) - only show if Acrobat might be available
-        self.import_btn = ttk.Button(action_frame, text="Import && Save PDF",
-                                     command=self.import_and_save)
-        self.import_btn.pack(side=tk.RIGHT)
-
-        self.create_btn = ttk.Button(action_frame, text="Create XFDF Only",
+        self.create_btn = ttk.Button(action_frame, text="Create XFDF",
                                       command=self.create_xfdf)
-        self.create_btn.pack(side=tk.RIGHT, padx=(0, 5))
+        self.create_btn.pack(side=tk.RIGHT)
 
         ttk.Button(action_frame, text="Preview",
-                   command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 5))
+                   command=self.preview_changes).pack(side=tk.RIGHT, padx=(0, 10))
 
     def select_base(self):
         filepath = filedialog.askopenfilename(
@@ -505,6 +371,26 @@ class CommentCollectorApp:
         else:
             self.status_var.set(f"Ready: 1 base + {len(self.other_files)} other file(s)")
 
+    def collect_new_annotations(self):
+        """Extract base and find new annotations from other files."""
+        base_annots = extract_annotations(self.base_file)
+        seen_keys = {a['_key'] for a in base_annots}
+        all_new = []
+
+        for i, filepath in enumerate(self.other_files):
+            self.status_var.set(f"Reading file {i+1} of {len(self.other_files)}...")
+            self.progress_var.set((i + 1) / len(self.other_files) * 80)
+            self.root.update()
+
+            other_annots = extract_annotations(filepath)
+            for a in other_annots:
+                if a['_key'] not in seen_keys:
+                    a['_source'] = os.path.basename(filepath)
+                    all_new.append(a)
+                    seen_keys.add(a['_key'])
+
+        return base_annots, all_new
+
     def preview_changes(self):
         """Show a summary of what would be exported."""
         if not self.base_file or not self.other_files:
@@ -513,51 +399,30 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
-        self.import_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
-            # Extract base annotations
             self.status_var.set("Reading base PDF...")
             self.root.update()
-            base_annots = extract_annotations(self.base_file)
 
-            # Extract and find new annotations from each file
-            all_new = []
-            seen_keys = {a['_key'] for a in base_annots}
-
-            for i, filepath in enumerate(self.other_files):
-                self.status_var.set(f"Reading file {i+1} of {len(self.other_files)}...")
-                self.progress_var.set((i + 1) / len(self.other_files) * 100)
-                self.root.update()
-
-                other_annots = extract_annotations(filepath)
-                for a in other_annots:
-                    if a['_key'] not in seen_keys:
-                        a['_source'] = os.path.basename(filepath)
-                        all_new.append(a)
-                        seen_keys.add(a['_key'])
-
+            base_annots, all_new = self.collect_new_annotations()
             self.progress_var.set(100)
 
             # Build summary
-            summary = f"BASE FILE: {os.path.basename(self.base_file)}\n"
+            summary = f"BASE: {os.path.basename(self.base_file)}\n"
             summary += f"  Existing comments: {len(base_annots)}\n\n"
             summary += f"NEW COMMENTS FOUND: {len(all_new)}\n\n"
 
             if all_new:
-                # Group by source
                 by_source = {}
                 for a in all_new:
                     src = a.get('_source', 'Unknown')
-                    if src not in by_source:
-                        by_source[src] = []
-                    by_source[src].append(a)
+                    by_source.setdefault(src, []).append(a)
 
                 for src, annots in by_source.items():
-                    summary += f"From {src}: {len(annots)} new comment(s)\n"
-                    for a in annots[:3]:  # Show first 3
-                        content = a['content'][:40] + "..." if len(a['content']) > 40 else a['content']
+                    summary += f"From {src}: {len(annots)} new\n"
+                    for a in annots[:3]:
+                        content = (a['content'][:35] + "...") if len(a['content']) > 35 else a['content']
                         summary += f"  • Page {a['page']+1}: {a['type']}"
                         if content:
                             summary += f" - {content}"
@@ -566,7 +431,7 @@ class CommentCollectorApp:
                         summary += f"  ... and {len(annots)-3} more\n"
                     summary += "\n"
             else:
-                summary += "No new comments to add. All comments already exist in base."
+                summary += "No new comments found."
 
             messagebox.showinfo("Preview", summary)
 
@@ -575,7 +440,6 @@ class CommentCollectorApp:
 
         finally:
             self.create_btn.config(state='normal')
-            self.import_btn.config(state='normal')
             self.progress_var.set(0)
             self.update_status()
 
@@ -586,7 +450,6 @@ class CommentCollectorApp:
                 "Please select a base PDF and at least one other PDF.")
             return
 
-        # Ask where to save
         default_name = os.path.splitext(os.path.basename(self.base_file))[0]
         save_path = filedialog.asksaveasfilename(
             title="Save XFDF File",
@@ -598,37 +461,20 @@ class CommentCollectorApp:
             return
 
         self.create_btn.config(state='disabled')
-        self.import_btn.config(state='disabled')
         self.progress_var.set(0)
 
         try:
-            # Extract base annotations
             self.status_var.set("Reading base PDF...")
             self.root.update()
-            base_annots = extract_annotations(self.base_file)
 
-            # Extract and collect new annotations
-            all_new = []
-            seen_keys = {a['_key'] for a in base_annots}
-
-            for i, filepath in enumerate(self.other_files):
-                self.status_var.set(f"Reading file {i+1} of {len(self.other_files)}...")
-                self.progress_var.set((i + 1) / (len(self.other_files) + 1) * 80)
-                self.root.update()
-
-                other_annots = extract_annotations(filepath)
-                for a in other_annots:
-                    if a['_key'] not in seen_keys:
-                        all_new.append(a)
-                        seen_keys.add(a['_key'])
+            base_annots, all_new = self.collect_new_annotations()
 
             if not all_new:
                 messagebox.showinfo("No New Comments",
-                    "No new comments were found in the other files.\n"
+                    "No new comments were found.\n"
                     "All comments already exist in the base PDF.")
                 return
 
-            # Create XFDF
             self.status_var.set("Creating XFDF file...")
             self.progress_var.set(90)
             self.root.update()
@@ -639,152 +485,25 @@ class CommentCollectorApp:
                 f.write(xfdf_content)
 
             self.progress_var.set(100)
-            self.status_var.set("XFDF created successfully!")
+            self.status_var.set("XFDF created!")
 
             messagebox.showinfo("Success",
                 f"Created XFDF with {len(all_new)} new comment(s).\n\n"
                 f"Saved to:\n{save_path}\n\n"
-                "To import into your PDF:\n"
-                "1. Open your base PDF in Adobe Acrobat\n"
-                "2. Go to Comment → Import Comments\n"
+                "To import:\n"
+                "1. Open base PDF in Adobe Acrobat\n"
+                "2. Comment → Import Comments\n"
                 "3. Select the XFDF file\n"
                 "4. Save your PDF")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create XFDF:\n\n{e}")
-            self.status_var.set("Failed to create XFDF")
+            self.status_var.set("Failed")
 
         finally:
             self.create_btn.config(state='normal')
-            self.import_btn.config(state='normal')
             self.progress_var.set(0)
-
-    def import_and_save(self):
-        """Create XFDF and automatically import it into the PDF using Acrobat."""
-        if not self.base_file or not self.other_files:
-            messagebox.showwarning("Missing Files",
-                "Please select a base PDF and at least one other PDF.")
-            return
-
-        # Check if Acrobat automation is available
-        if not ACROBAT_AVAILABLE:
-            result = messagebox.askyesno(
-                "Acrobat Automation Not Available",
-                "Automatic PDF merging requires pywin32.\n\n"
-                "To enable this feature, run:\n"
-                "pip install pywin32\n\n"
-                "Would you like to create an XFDF file instead?\n"
-                "(You can import it manually in Acrobat)"
-            )
-            if result:
-                self.create_xfdf()
-            return
-
-        if not check_acrobat_available():
-            result = messagebox.askyesno(
-                "Adobe Acrobat Not Found",
-                "Adobe Acrobat Pro is required for automatic import.\n\n"
-                "Make sure Acrobat Pro (not Reader) is installed.\n\n"
-                "Would you like to create an XFDF file instead?\n"
-                "(You can import it manually in Acrobat)"
-            )
-            if result:
-                self.create_xfdf()
-            return
-
-        # Ask where to save the merged PDF
-        default_name = os.path.splitext(os.path.basename(self.base_file))[0]
-        save_path = filedialog.asksaveasfilename(
-            title="Save Output PDF",
-            defaultextension=".pdf",
-            initialfile=f"{default_name}_with_imports.pdf",
-            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
-        )
-        if not save_path:
-            return
-
-        self.import_btn.config(state='disabled')
-        self.create_btn.config(state='disabled')
-        self.progress_var.set(0)
-
-        # Create a temp file for the XFDF
-        import tempfile
-        temp_xfdf = None
-
-        try:
-            # Phase 1: Extract annotations
-            self.status_var.set("Reading base PDF...")
-            self.root.update()
-            base_annots = extract_annotations(self.base_file)
-
-            all_new = []
-            seen_keys = {a['_key'] for a in base_annots}
-
-            for i, filepath in enumerate(self.other_files):
-                self.status_var.set(f"Reading file {i+1} of {len(self.other_files)}...")
-                self.progress_var.set((i + 1) / (len(self.other_files) + 2) * 60)
-                self.root.update()
-
-                other_annots = extract_annotations(filepath)
-                for a in other_annots:
-                    if a['_key'] not in seen_keys:
-                        all_new.append(a)
-                        seen_keys.add(a['_key'])
-
-            if not all_new:
-                messagebox.showinfo("No New Comments",
-                    "No new comments were found in the other files.\n"
-                    "All comments already exist in the base PDF.")
-                return
-
-            # Phase 2: Create temporary XFDF
-            self.status_var.set("Creating XFDF...")
-            self.progress_var.set(70)
-            self.root.update()
-
-            xfdf_content = create_xfdf(all_new, os.path.basename(self.base_file))
-
-            # Write to temp file
-            temp_fd, temp_xfdf = tempfile.mkstemp(suffix='.xfdf')
-            os.close(temp_fd)
-            with open(temp_xfdf, 'w', encoding='utf-8') as f:
-                f.write(xfdf_content)
-
-            # Phase 3: Use Acrobat to import
-            self.status_var.set("Importing comments via Adobe Acrobat...")
-            self.progress_var.set(85)
-            self.root.update()
-
-            # Copy base PDF to output location first
-            import shutil
-            shutil.copy2(self.base_file, save_path)
-
-            # Import XFDF into the copy
-            import_xfdf_with_acrobat(save_path, temp_xfdf, save_path)
-
-            self.progress_var.set(100)
-            self.status_var.set("Import complete!")
-
-            messagebox.showinfo("Success",
-                f"Successfully imported {len(all_new)} new comment(s)!\n\n"
-                f"Saved to:\n{save_path}")
-
-        except Exception as e:
-            messagebox.showerror("Import Failed",
-                f"Failed to import PDF:\n\n{str(e)}\n\n"
-                "Try using 'Create XFDF Only' and import manually in Acrobat.")
-            self.status_var.set("Import failed")
-
-        finally:
-            # Clean up temp file
-            if temp_xfdf and os.path.exists(temp_xfdf):
-                try:
-                    os.remove(temp_xfdf)
-                except:
-                    pass
-            self.import_btn.config(state='normal')
-            self.create_btn.config(state='normal')
-            self.progress_var.set(0)
+            self.update_status()
 
 
 def main():
@@ -794,7 +513,7 @@ def main():
         windll.shcore.SetProcessDpiAwareness(1)
     except:
         pass
-    app = CommentCollectorApp(root)
+    CommentCollectorApp(root)
     root.mainloop()
 
 

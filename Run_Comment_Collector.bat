@@ -17,29 +17,13 @@ REM Check if PyMuPDF is installed, install if not
 python -c "import fitz" >nul 2>&1
 if errorlevel 1 (
     echo Installing required dependency (PyMuPDF)...
-    echo.
     pip install pymupdf
     if errorlevel 1 (
-        echo.
-        echo Failed to install PyMuPDF. Please run this command manually:
-        echo pip install pymupdf
-        echo.
+        echo Failed to install. Please run: pip install pymupdf
         pause
         exit /b 1
     )
-    echo.
-    echo Installation complete!
-    echo.
-)
-
-REM Check for pywin32 (optional - enables automatic merge)
-python -c "import win32com.client" >nul 2>&1
-if errorlevel 1 (
-    echo.
-    echo Optional: Installing pywin32 for automatic Acrobat integration...
-    pip install pywin32 >nul 2>&1
 )
 
 REM Run the application
-echo Starting PDF Comment Collector...
 pythonw "%~dp0PDF_Comment_Collector.pyw"

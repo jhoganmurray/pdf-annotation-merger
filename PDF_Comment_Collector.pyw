@@ -56,7 +56,6 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
 
     for page_num in range(doc.page_count):
         page = doc[page_num]
-        # PDF coordinate system: origin at bottom-left
         page_height = page.rect.height
 
         for annot in page.annots() or []:
@@ -64,7 +63,6 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
                 'page': page_num,
                 'type': annot.type[1],
                 'type_code': annot.type[0],
-                # Store rect as-is (PyMuPDF already handles coordinate conversion)
                 'rect': list(annot.rect),
                 'content': annot.info.get('content', '') or '',
                 'author': annot.info.get('title', '') or '',
@@ -73,7 +71,18 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
                 'modified': annot.info.get('modDate', '') or '',
                 'opacity': annot.opacity if annot.opacity >= 0 else 1.0,
                 'page_height': page_height,
+                'flags': annot.flags,
             }
+
+            # Border style (includes line width)
+            if annot.border:
+                border = annot.border
+                if border.get('width') and border['width'] > 0:
+                    data['border_width'] = border['width']
+                if border.get('dashes'):
+                    data['border_dashes'] = list(border['dashes'])
+                if border.get('style'):
+                    data['border_style'] = border['style']
 
             # Colors
             if annot.colors:
@@ -86,12 +95,19 @@ def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
             if annot.vertices:
                 data['vertices'] = annot.vertices
 
+            # Line endings (for line annotations)
+            if annot.type[0] == fitz.PDF_ANNOT_LINE:
+                try:
+                    data['line_ends'] = annot.line_ends
+                except:
+                    pass
+
             # Create unique key for deduplication
             key_parts = [
                 str(page_num),
                 annot.type[1],
                 ','.join(f"{x:.1f}" for x in annot.rect),
-                data['content'][:100],  # First 100 chars of content
+                data['content'][:100],
             ]
             data['_key'] = hashlib.md5('|'.join(key_parts).encode()).hexdigest()
 
@@ -209,6 +225,14 @@ def create_xfdf(annotations: List[Dict], base_pdf_name: str) -> str:
         color = a.get('stroke_color') or a.get('fill_color')
         if color:
             elem.set('color', rgb_to_hex(color))
+
+        # Border width (line thickness)
+        if a.get('border_width'):
+            elem.set('width', f"{a['border_width']:.2f}")
+
+        # Flags
+        if a.get('flags'):
+            elem.set('flags', str(a['flags']))
 
         # Title/Author
         if a.get('author'):

@@ -2,32 +2,33 @@
 """
 PDF Annotation Merger - Windows GUI Application
 
-A simple tool to merge annotations from multiple versions of the same PDF
-into a single consolidated file. Designed to solve OneDrive sync conflicts.
+Merges annotations from multiple versions of the same PDF by:
+1. Extracting annotations to a data format (similar to Adobe's XFDF export)
+2. Deduplicating based on position, type, and content
+3. Applying merged annotations to a clean base document
 
 Requirements:
     pip install pymupdf
 
 Usage:
-    Double-click this file to run, or:
-    python PDF_Annotation_Merger.pyw
+    Double-click this file to run, or: python PDF_Annotation_Merger.pyw
 """
 
 import os
 import sys
+import json
 import datetime
 import tempfile
 import shutil
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Tuple, Set
-from dataclasses import dataclass
+from typing import List, Dict, Set, Any, Optional
 
 # Check for PyMuPDF
 try:
     import fitz
 except ImportError:
-    # Show error in GUI if possible
     root = tk.Tk()
     root.withdraw()
     messagebox.showerror(
@@ -40,198 +41,166 @@ except ImportError:
     sys.exit(1)
 
 
-@dataclass
-class AnnotationKey:
-    """Hashable key for identifying unique annotations"""
-    page: int
-    annot_type: str
-    rect: Tuple[float, float, float, float]
-    content: str
+# =============================================================================
+# ANNOTATION DATA MODEL (similar to XFDF concept)
+# =============================================================================
 
-    def __hash__(self):
-        return hash((self.page, self.annot_type, self.rect, self.content))
-
-    def __eq__(self, other):
-        return (self.page == other.page and
-                self.annot_type == other.annot_type and
-                self.rect == other.rect and
-                self.content == other.content)
-
-
-def round_rect(rect, precision=1) -> Tuple[float, float, float, float]:
-    """Round rectangle coordinates for comparison"""
-    return tuple(round(x, precision) for x in rect)
-
-
-def repair_pdf(input_path: str, temp_dir: str) -> str:
+def annotation_to_data(annot, page_num: int) -> Dict[str, Any]:
     """
-    Repair a PDF by opening and re-saving it with cleanup options.
-    This fixes xref table issues common in OneDrive-edited PDFs.
-    Returns path to the repaired temporary file.
+    Extract annotation properties to a dictionary.
+    This is similar to Adobe's XFDF export - separating annotation data from PDF.
     """
-    import io
+    data = {
+        'page': page_num,
+        'type': annot.type[1],
+        'type_code': annot.type[0],
+        'rect': [round(x, 2) for x in annot.rect],
+        'content': annot.info.get('content', '') or '',
+        'author': annot.info.get('title', '') or '',
+        'subject': annot.info.get('subject', '') or '',
+        'opacity': annot.opacity if annot.opacity >= 0 else 1.0,
+    }
 
-    # Create a temp file path
-    base_name = os.path.basename(input_path)
-    temp_path = os.path.join(temp_dir, f"repaired_{base_name}")
+    # Colors
+    if annot.colors:
+        if annot.colors.get('stroke'):
+            data['stroke_color'] = list(annot.colors['stroke'])
+        if annot.colors.get('fill'):
+            data['fill_color'] = list(annot.colors['fill'])
 
-    # Suppress MuPDF warnings during open/save (xref errors are recoverable)
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
+    # Vertices for ink, line, polygon, polyline annotations
+    if annot.vertices:
+        # Flatten nested structure and round coordinates
+        vertices = []
+        for item in annot.vertices:
+            if isinstance(item, (list, tuple)):
+                if isinstance(item[0], (list, tuple)):
+                    # Nested list of points (ink annotations)
+                    vertices.append([[round(p[0], 2), round(p[1], 2)] for p in item])
+                else:
+                    # Single point
+                    vertices.append([round(item[0], 2), round(item[1], 2)])
+            else:
+                vertices.append(item)
+        data['vertices'] = vertices
 
+    return data
+
+
+def compute_annotation_key(annot_data: Dict[str, Any]) -> str:
+    """
+    Compute a unique key for deduplication.
+    Two annotations are considered duplicates if they have the same:
+    - Page number
+    - Type
+    - Position (rect)
+    - Content text
+    """
+    key_parts = [
+        str(annot_data['page']),
+        annot_data['type'],
+        json.dumps(annot_data['rect']),
+        annot_data['content'],
+    ]
+    key_string = '|'.join(key_parts)
+    return hashlib.md5(key_string.encode()).hexdigest()
+
+
+def data_to_annotation(page, annot_data: Dict[str, Any]) -> bool:
+    """
+    Create an annotation on a page from data dictionary.
+    This is similar to Adobe's XFDF import.
+    Returns True if successful.
+    """
     try:
-        # Open the document - MuPDF will attempt to repair on open
-        doc = fitz.open(input_path)
-        # Save with all cleanup options
-        doc.save(temp_path, garbage=4, deflate=True, clean=True)
-        doc.close()
-    except Exception as e:
-        # If repair fails, try copying the original and working with it directly
-        sys.stderr = old_stderr
-        error_msg = str(e).lower()
-        # Only re-raise if it's not a recoverable xref error
-        if "xref" not in error_msg and "object" not in error_msg:
-            raise
-        # For xref errors, just copy the file and hope for the best
-        shutil.copy2(input_path, temp_path)
-    finally:
-        sys.stderr = old_stderr
-
-    return temp_path
-
-
-def open_pdf_safe(filepath: str):
-    """Open a PDF file, suppressing recoverable MuPDF warnings."""
-    import io
-
-    old_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-
-    try:
-        doc = fitz.open(filepath)
-    except Exception as e:
-        sys.stderr = old_stderr
-        error_msg = str(e).lower()
-        # Re-raise if it's not a recoverable error
-        if "xref" not in error_msg and "object" not in error_msg:
-            raise
-        # Try opening again without stderr suppression
-        doc = fitz.open(filepath)
-    finally:
-        sys.stderr = old_stderr
-
-    return doc
-
-
-def extract_annotation_keys(doc) -> dict:
-    """Extract all annotations from a document"""
-    annotations = {}
-    for page_num in range(doc.page_count):
-        page = doc[page_num]
-        annots = list(page.annots()) if page.annots() else []
-        for annot in annots:
-            info = annot.info
-            key = AnnotationKey(
-                page=page_num,
-                annot_type=annot.type[1],
-                rect=round_rect(annot.rect),
-                content=info.get('content', '') or ''
-            )
-            annotations[key] = True
-    return annotations
-
-
-def copy_annotation(source_page, target_page, annot) -> bool:
-    """Copy an annotation from source page to target page"""
-    try:
-        annot_type = annot.type[0]
-        info = annot.info
-        rect = annot.rect
+        annot_type = annot_data['type_code']
+        rect = fitz.Rect(annot_data['rect'])
+        content = annot_data.get('content', '')
         new_annot = None
 
         if annot_type == fitz.PDF_ANNOT_FREE_TEXT:
-            new_annot = target_page.add_freetext_annot(
-                rect,
-                info.get('content', ''),
+            fill = annot_data.get('fill_color')
+            new_annot = page.add_freetext_annot(
+                rect, content,
                 fontsize=11,
                 text_color=(0, 0, 0),
-                fill_color=annot.colors.get('fill') if annot.colors else None,
+                fill_color=fill if fill else None,
             )
 
         elif annot_type == fitz.PDF_ANNOT_TEXT:
-            new_annot = target_page.add_text_annot(rect.tl, info.get('content', ''))
+            new_annot = page.add_text_annot(rect.tl, content)
 
         elif annot_type == fitz.PDF_ANNOT_HIGHLIGHT:
-            quads = annot.vertices
-            if quads:
-                new_annot = target_page.add_highlight_annot(quads=quads)
+            vertices = annot_data.get('vertices')
+            if vertices:
+                new_annot = page.add_highlight_annot(quads=vertices)
             else:
-                new_annot = target_page.add_highlight_annot(rect)
+                new_annot = page.add_highlight_annot(rect)
 
         elif annot_type == fitz.PDF_ANNOT_UNDERLINE:
-            quads = annot.vertices
-            if quads:
-                new_annot = target_page.add_underline_annot(quads=quads)
+            vertices = annot_data.get('vertices')
+            if vertices:
+                new_annot = page.add_underline_annot(quads=vertices)
             else:
-                new_annot = target_page.add_underline_annot(rect)
+                new_annot = page.add_underline_annot(rect)
 
         elif annot_type == fitz.PDF_ANNOT_STRIKE_OUT:
-            quads = annot.vertices
-            if quads:
-                new_annot = target_page.add_strikeout_annot(quads=quads)
+            vertices = annot_data.get('vertices')
+            if vertices:
+                new_annot = page.add_strikeout_annot(quads=vertices)
             else:
-                new_annot = target_page.add_strikeout_annot(rect)
+                new_annot = page.add_strikeout_annot(rect)
 
         elif annot_type == fitz.PDF_ANNOT_INK:
-            ink_list = annot.vertices
-            if ink_list:
-                new_annot = target_page.add_ink_annot(ink_list)
+            vertices = annot_data.get('vertices')
+            if vertices:
+                new_annot = page.add_ink_annot(vertices)
 
         elif annot_type == fitz.PDF_ANNOT_LINE:
-            vertices = annot.vertices
+            vertices = annot_data.get('vertices')
             if vertices and len(vertices) >= 2:
-                new_annot = target_page.add_line_annot(
+                new_annot = page.add_line_annot(
                     fitz.Point(vertices[0]),
                     fitz.Point(vertices[1])
                 )
 
         elif annot_type == fitz.PDF_ANNOT_SQUARE:
-            new_annot = target_page.add_rect_annot(rect)
+            new_annot = page.add_rect_annot(rect)
 
         elif annot_type == fitz.PDF_ANNOT_CIRCLE:
-            new_annot = target_page.add_circle_annot(rect)
+            new_annot = page.add_circle_annot(rect)
 
         elif annot_type == fitz.PDF_ANNOT_POLYGON:
-            vertices = annot.vertices
+            vertices = annot_data.get('vertices')
             if vertices:
-                new_annot = target_page.add_polygon_annot(vertices)
+                new_annot = page.add_polygon_annot(vertices)
 
         elif annot_type == fitz.PDF_ANNOT_POLYLINE:
-            vertices = annot.vertices
+            vertices = annot_data.get('vertices')
             if vertices:
-                new_annot = target_page.add_polyline_annot(vertices)
+                new_annot = page.add_polyline_annot(vertices)
 
         elif annot_type == fitz.PDF_ANNOT_STAMP:
-            new_annot = target_page.add_stamp_annot(rect, stamp=0)
+            new_annot = page.add_stamp_annot(rect, stamp=0)
 
         elif annot_type == fitz.PDF_ANNOT_CARET:
-            new_annot = target_page.add_caret_annot(rect.tl)
+            new_annot = page.add_caret_annot(rect.tl)
 
         else:
             return False
 
+        # Apply common properties
         if new_annot:
-            if annot.colors:
-                if annot.colors.get('stroke'):
-                    new_annot.set_colors(stroke=annot.colors['stroke'])
-                if annot.colors.get('fill'):
-                    new_annot.set_colors(fill=annot.colors['fill'])
-            if info.get('content'):
-                new_annot.set_info(content=info['content'])
-            if info.get('title'):
-                new_annot.set_info(title=info['title'])
-            if annot.opacity is not None and annot.opacity < 1.0:
-                new_annot.set_opacity(annot.opacity)
+            if annot_data.get('stroke_color'):
+                new_annot.set_colors(stroke=annot_data['stroke_color'])
+            if annot_data.get('fill_color'):
+                new_annot.set_colors(fill=annot_data['fill_color'])
+            if content:
+                new_annot.set_info(content=content)
+            if annot_data.get('author'):
+                new_annot.set_info(title=annot_data['author'])
+            if annot_data.get('opacity', 1.0) < 1.0:
+                new_annot.set_opacity(annot_data['opacity'])
             new_annot.update()
             return True
 
@@ -241,33 +210,156 @@ def copy_annotation(source_page, target_page, annot) -> bool:
         return False
 
 
+# =============================================================================
+# PDF OPERATIONS
+# =============================================================================
+
+def open_pdf_safe(filepath: str):
+    """Open PDF suppressing recoverable MuPDF warnings."""
+    import io
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        doc = fitz.open(filepath)
+    except Exception as e:
+        sys.stderr = old_stderr
+        if "xref" not in str(e).lower():
+            raise
+        doc = fitz.open(filepath)
+    finally:
+        sys.stderr = old_stderr
+    return doc
+
+
+def extract_annotations(filepath: str) -> List[Dict[str, Any]]:
+    """
+    Extract all annotations from a PDF as data dictionaries.
+    Similar to Adobe Acrobat's "Export Comments" feature.
+    """
+    doc = open_pdf_safe(filepath)
+    annotations = []
+
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        for annot in page.annots() or []:
+            annot_data = annotation_to_data(annot, page_num)
+            annot_data['_key'] = compute_annotation_key(annot_data)
+            annot_data['_source'] = os.path.basename(filepath)
+            annotations.append(annot_data)
+
+    doc.close()
+    return annotations
+
+
+def merge_annotations(annotation_lists: List[List[Dict]]) -> List[Dict[str, Any]]:
+    """
+    Merge multiple annotation lists, removing duplicates.
+    First list is considered the "base" - its annotations take precedence.
+    """
+    seen_keys: Set[str] = set()
+    merged: List[Dict[str, Any]] = []
+
+    for annot_list in annotation_lists:
+        for annot_data in annot_list:
+            key = annot_data['_key']
+            if key not in seen_keys:
+                seen_keys.add(key)
+                merged.append(annot_data)
+
+    return merged
+
+
+def apply_annotations_to_pdf(input_path: str, output_path: str,
+                              annotations: List[Dict[str, Any]],
+                              progress_callback=None) -> Dict[str, int]:
+    """
+    Apply annotation data to a PDF, creating a new output file.
+    Similar to Adobe Acrobat's "Import Comments" feature.
+    """
+    import io
+
+    # Open and repair source PDF
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+
+    try:
+        doc = fitz.open(input_path)
+
+        # First, remove all existing annotations to start clean
+        for page in doc:
+            # Get list of annotations first to avoid modification during iteration
+            annots_to_delete = list(page.annots() or [])
+            for annot in annots_to_delete:
+                page.delete_annot(annot)
+
+    finally:
+        sys.stderr = old_stderr
+
+    # Group annotations by page for efficient processing
+    by_page: Dict[int, List[Dict]] = {}
+    for annot_data in annotations:
+        page_num = annot_data['page']
+        if page_num not in by_page:
+            by_page[page_num] = []
+        by_page[page_num].append(annot_data)
+
+    # Apply annotations
+    stats = {'applied': 0, 'failed': 0}
+    total = len(annotations)
+    done = 0
+
+    for page_num in sorted(by_page.keys()):
+        if page_num >= doc.page_count:
+            continue
+
+        page = doc[page_num]
+        for annot_data in by_page[page_num]:
+            if data_to_annotation(page, annot_data):
+                stats['applied'] += 1
+            else:
+                stats['failed'] += 1
+
+            done += 1
+            if progress_callback:
+                progress_callback(done / total * 100)
+
+    # Save
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        doc.save(output_path, garbage=4, deflate=True, clean=True)
+    finally:
+        sys.stderr = old_stderr
+
+    doc.close()
+    return stats
+
+
+# =============================================================================
+# GUI APPLICATION
+# =============================================================================
+
 class PDFMergerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Annotation Merger")
-        self.root.geometry("600x450")
+        self.root.geometry("650x500")
         self.root.resizable(True, True)
+        self.root.minsize(550, 450)
 
-        # Set minimum size
-        self.root.minsize(500, 400)
-
-        # Store selected files
         self.selected_files: List[str] = []
-
         self.create_widgets()
 
     def create_widgets(self):
-        # Main frame with padding
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky="nsew")
 
-        # Configure grid weights for resizing
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
 
-        # Title and instructions
+        # Title
         title_label = ttk.Label(
             main_frame,
             text="PDF Annotation Merger",
@@ -275,22 +367,22 @@ class PDFMergerApp:
         )
         title_label.grid(row=0, column=0, pady=(0, 5), sticky="w")
 
+        # Instructions
         instructions = ttk.Label(
             main_frame,
             text="Select multiple versions of the same PDF to merge their annotations.\n"
-                 "The first file selected will be used as the base document.",
+                 "Works like Adobe's Export/Import Comments, with automatic deduplication.",
             font=('Segoe UI', 9),
             foreground='gray'
         )
         instructions.grid(row=1, column=0, pady=(0, 10), sticky="w")
 
-        # File list frame
-        list_frame = ttk.LabelFrame(main_frame, text="Selected Files", padding="5")
+        # File list
+        list_frame = ttk.LabelFrame(main_frame, text="Selected Files (first = base document)", padding="5")
         list_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
-        # Listbox with scrollbar
         self.file_listbox = tk.Listbox(
             list_frame,
             selectmode=tk.EXTENDED,
@@ -302,68 +394,38 @@ class PDFMergerApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.file_listbox.config(yscrollcommand=scrollbar.set)
 
-        # Button frame
+        # Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
-        ttk.Button(
-            button_frame,
-            text="Add Files...",
-            command=self.add_files
-        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(button_frame, text="Add Files...", command=self.add_files).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(button_frame, text="Remove Selected", command=self.remove_selected).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(button_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Move Up", command=self.move_up).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(button_frame, text="Move Down", command=self.move_down).pack(side=tk.RIGHT)
 
-        ttk.Button(
-            button_frame,
-            text="Remove Selected",
-            command=self.remove_selected
-        ).pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Button(
-            button_frame,
-            text="Clear All",
-            command=self.clear_all
-        ).pack(side=tk.LEFT)
-
-        ttk.Button(
-            button_frame,
-            text="Move Up",
-            command=self.move_up
-        ).pack(side=tk.RIGHT, padx=(5, 0))
-
-        ttk.Button(
-            button_frame,
-            text="Move Down",
-            command=self.move_down
-        ).pack(side=tk.RIGHT)
-
-        # Progress bar
+        # Progress
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            main_frame,
-            variable=self.progress_var,
-            maximum=100
-        )
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.grid(row=4, column=0, sticky="ew", pady=(0, 5))
 
-        # Status label
+        # Status
         self.status_var = tk.StringVar(value="Select at least 2 PDF files to merge")
-        self.status_label = ttk.Label(
-            main_frame,
-            textvariable=self.status_var,
-            font=('Segoe UI', 9)
-        )
+        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, font=('Segoe UI', 9))
         self.status_label.grid(row=5, column=0, sticky="w", pady=(0, 10))
 
-        # Merge button
-        self.merge_button = ttk.Button(
-            main_frame,
-            text="Merge Annotations",
-            command=self.merge_files,
-            style='Accent.TButton'
-        )
-        self.merge_button.grid(row=6, column=0, sticky="e")
+        # Action buttons frame
+        action_frame = ttk.Frame(main_frame)
+        action_frame.grid(row=6, column=0, sticky="ew")
 
-        # Try to style the merge button (works on Windows 10+)
+        # Export JSON button (optional feature)
+        self.export_btn = ttk.Button(action_frame, text="Export Data...", command=self.export_json)
+        self.export_btn.pack(side=tk.LEFT)
+
+        # Merge button
+        self.merge_button = ttk.Button(action_frame, text="Merge Annotations", command=self.merge_files)
+        self.merge_button.pack(side=tk.RIGHT)
+
         try:
             style = ttk.Style()
             style.configure('Accent.TButton', font=('Segoe UI', 10, 'bold'))
@@ -375,18 +437,14 @@ class PDFMergerApp:
             title="Select PDF Files to Merge",
             filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
         )
-
         for f in files:
             if f not in self.selected_files:
                 self.selected_files.append(f)
                 self.file_listbox.insert(tk.END, os.path.basename(f))
-
         self.update_status()
 
     def remove_selected(self):
-        selected_indices = list(self.file_listbox.curselection())
-        # Remove in reverse order to maintain correct indices
-        for i in reversed(selected_indices):
+        for i in reversed(self.file_listbox.curselection()):
             self.file_listbox.delete(i)
             del self.selected_files[i]
         self.update_status()
@@ -400,14 +458,9 @@ class PDFMergerApp:
         selected = self.file_listbox.curselection()
         if not selected or selected[0] == 0:
             return
-
         for i in selected:
             if i > 0:
-                # Swap in list
-                self.selected_files[i], self.selected_files[i-1] = \
-                    self.selected_files[i-1], self.selected_files[i]
-
-                # Swap in listbox
+                self.selected_files[i], self.selected_files[i-1] = self.selected_files[i-1], self.selected_files[i]
                 text = self.file_listbox.get(i)
                 self.file_listbox.delete(i)
                 self.file_listbox.insert(i-1, text)
@@ -417,14 +470,9 @@ class PDFMergerApp:
         selected = self.file_listbox.curselection()
         if not selected or selected[-1] == self.file_listbox.size() - 1:
             return
-
         for i in reversed(selected):
             if i < self.file_listbox.size() - 1:
-                # Swap in list
-                self.selected_files[i], self.selected_files[i+1] = \
-                    self.selected_files[i+1], self.selected_files[i]
-
-                # Swap in listbox
+                self.selected_files[i], self.selected_files[i+1] = self.selected_files[i+1], self.selected_files[i]
                 text = self.file_listbox.get(i)
                 self.file_listbox.delete(i)
                 self.file_listbox.insert(i+1, text)
@@ -439,22 +487,97 @@ class PDFMergerApp:
         else:
             self.status_var.set(f"{count} files selected - Ready to merge")
 
-    def merge_files(self):
-        if len(self.selected_files) < 2:
-            messagebox.showwarning(
-                "Not Enough Files",
-                "Please select at least 2 PDF files to merge."
-            )
+    def export_json(self):
+        """Export merged annotation data to JSON for inspection."""
+        if len(self.selected_files) < 1:
+            messagebox.showwarning("No Files", "Please select at least 1 PDF file.")
             return
 
-        # Disable UI during merge
+        save_path = filedialog.asksaveasfilename(
+            title="Export Annotation Data",
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")]
+        )
+        if not save_path:
+            return
+
         self.merge_button.config(state='disabled')
-        self.progress_var.set(0)
-        self.status_var.set("Merging annotations...")
-        self.root.update()
+        self.export_btn.config(state='disabled')
 
         try:
-            result = self.perform_merge()
+            all_annotations = []
+            for i, filepath in enumerate(self.selected_files):
+                self.status_var.set(f"Extracting from file {i+1} of {len(self.selected_files)}...")
+                self.progress_var.set((i / len(self.selected_files)) * 100)
+                self.root.update()
+                all_annotations.append(extract_annotations(filepath))
+
+            merged = merge_annotations(all_annotations)
+
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(merged, f, indent=2, ensure_ascii=False)
+
+            self.progress_var.set(100)
+            messagebox.showinfo(
+                "Export Complete",
+                f"Exported {len(merged)} unique annotations to:\n{save_path}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Export Failed", f"Error: {e}")
+
+        finally:
+            self.merge_button.config(state='normal')
+            self.export_btn.config(state='normal')
+            self.progress_var.set(0)
+            self.update_status()
+
+    def merge_files(self):
+        if len(self.selected_files) < 2:
+            messagebox.showwarning("Not Enough Files", "Please select at least 2 PDF files to merge.")
+            return
+
+        self.merge_button.config(state='disabled')
+        self.export_btn.config(state='disabled')
+        self.progress_var.set(0)
+
+        try:
+            # Phase 1: Extract annotations from all files
+            all_annotations = []
+            for i, filepath in enumerate(self.selected_files):
+                self.status_var.set(f"Extracting annotations from file {i+1} of {len(self.selected_files)}...")
+                self.progress_var.set((i / len(self.selected_files)) * 30)
+                self.root.update()
+                all_annotations.append(extract_annotations(filepath))
+
+            # Phase 2: Merge and deduplicate
+            self.status_var.set("Deduplicating annotations...")
+            self.progress_var.set(40)
+            self.root.update()
+
+            base_count = len(all_annotations[0])
+            merged = merge_annotations(all_annotations)
+            new_count = len(merged) - base_count
+
+            # Phase 3: Apply to output
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            base_name = os.path.splitext(os.path.basename(self.selected_files[0]))[0]
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(script_dir, f"{base_name}_MERGED_{timestamp}.pdf")
+
+            self.status_var.set("Creating merged PDF...")
+            self.root.update()
+
+            def progress_cb(pct):
+                self.progress_var.set(50 + pct * 0.5)
+                self.root.update()
+
+            stats = apply_annotations_to_pdf(
+                self.selected_files[0],
+                output_path,
+                merged,
+                progress_callback=progress_cb
+            )
 
             self.progress_var.set(100)
             self.status_var.set("Merge complete!")
@@ -462,134 +585,30 @@ class PDFMergerApp:
             messagebox.showinfo(
                 "Merge Complete",
                 f"Successfully merged annotations!\n\n"
-                f"Files processed: {result['files_processed']}\n"
-                f"Base annotations: {result['base_annotations']}\n"
-                f"New annotations added: {result['merged_annotations']}\n"
-                f"Duplicates skipped: {result['duplicate_annotations']}\n\n"
-                f"Output saved to:\n{result['output_path']}"
+                f"Files processed: {len(self.selected_files)}\n"
+                f"Total unique annotations: {len(merged)}\n"
+                f"New annotations added: {new_count}\n"
+                f"Duplicates removed: {sum(len(a) for a in all_annotations) - len(merged)}\n\n"
+                f"Output saved to:\n{output_path}"
             )
 
         except Exception as e:
-            messagebox.showerror(
-                "Merge Failed",
-                f"An error occurred during merge:\n\n{str(e)}"
-            )
-            self.status_var.set("Merge failed - see error message")
+            messagebox.showerror("Merge Failed", f"An error occurred:\n\n{str(e)}")
+            self.status_var.set("Merge failed")
 
         finally:
             self.merge_button.config(state='normal')
+            self.export_btn.config(state='normal')
             self.progress_var.set(0)
-
-    def perform_merge(self) -> dict:
-        """Perform the actual merge operation"""
-        stats = {
-            'base_annotations': 0,
-            'merged_annotations': 0,
-            'failed_annotations': 0,
-            'duplicate_annotations': 0,
-            'files_processed': len(self.selected_files),
-            'output_path': ''
-        }
-
-        # Determine output path (same directory as script)
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        base_name = os.path.splitext(os.path.basename(self.selected_files[0]))[0]
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"{base_name}_MERGED_{timestamp}.pdf"
-        output_path = os.path.join(script_dir, output_filename)
-        stats['output_path'] = output_path
-
-        # Create temp directory for repaired PDFs
-        temp_dir = tempfile.mkdtemp(prefix="pdf_merger_")
-
-        try:
-            total_files = len(self.selected_files)
-
-            # Repair base document first
-            self.status_var.set("Repairing PDF 1 of {}...".format(total_files))
-            self.root.update()
-            repaired_base = repair_pdf(self.selected_files[0], temp_dir)
-
-            # Open repaired base document
-            base_doc = open_pdf_safe(repaired_base)
-            base_keys = extract_annotation_keys(base_doc)
-            stats['base_annotations'] = len(base_keys)
-
-            all_seen_keys: Set[AnnotationKey] = set(base_keys.keys())
-
-            # Process each additional file
-            for file_idx, input_path in enumerate(self.selected_files[1:], start=2):
-                # Update progress
-                progress = (file_idx - 1) / total_files * 100
-                self.progress_var.set(progress)
-                self.status_var.set(f"Repairing PDF {file_idx} of {total_files}...")
-                self.root.update()
-
-                # Repair the source PDF
-                repaired_source = repair_pdf(input_path, temp_dir)
-
-                self.status_var.set(f"Processing file {file_idx} of {total_files}...")
-                self.root.update()
-
-                source_doc = open_pdf_safe(repaired_source)
-                source_keys = extract_annotation_keys(source_doc)
-
-                # Find unique annotations
-                unique_keys = set(source_keys.keys()) - all_seen_keys
-
-                # Copy unique annotations
-                for page_num in range(source_doc.page_count):
-                    source_page = source_doc[page_num]
-                    target_page = base_doc[page_num]
-
-                    annots = list(source_page.annots()) if source_page.annots() else []
-
-                    for annot in annots:
-                        info = annot.info
-                        key = AnnotationKey(
-                            page=page_num,
-                            annot_type=annot.type[1],
-                            rect=round_rect(annot.rect),
-                            content=info.get('content', '') or ''
-                        )
-
-                        if key in unique_keys:
-                            if copy_annotation(source_page, target_page, annot):
-                                stats['merged_annotations'] += 1
-                                all_seen_keys.add(key)
-                            else:
-                                stats['failed_annotations'] += 1
-
-                stats['duplicate_annotations'] += len(source_keys) - len(unique_keys)
-                source_doc.close()
-
-            # Save merged document
-            self.status_var.set("Saving merged document...")
-            self.root.update()
-
-            base_doc.save(output_path, garbage=4, deflate=True, clean=True)
-            base_doc.close()
-
-        finally:
-            # Clean up temp directory
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-
-        return stats
 
 
 def main():
     root = tk.Tk()
-
-    # Set DPI awareness for Windows 10+
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except:
         pass
-
     app = PDFMergerApp(root)
     root.mainloop()
 

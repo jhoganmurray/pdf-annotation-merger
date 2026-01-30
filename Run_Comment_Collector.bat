@@ -17,9 +17,9 @@ REM Check if PyMuPDF is installed, install if not
 python -c "import fitz" >nul 2>&1
 if errorlevel 1 (
     echo Installing required dependency (PyMuPDF)...
-    pip install pymupdf
+    python -m pip install pymupdf
     if errorlevel 1 (
-        echo Failed to install. Please run: pip install pymupdf
+        echo Failed to install. Please run: python -m pip install pymupdf
         pause
         exit /b 1
     )
@@ -29,7 +29,7 @@ REM Check if pikepdf is installed, install if not (for direct merge feature)
 python -c "import pikepdf" >nul 2>&1
 if errorlevel 1 (
     echo Installing optional dependency (pikepdf) for direct PDF merge...
-    pip install pikepdf
+    python -m pip install pikepdf
     if errorlevel 1 (
         echo Note: pikepdf not installed. Merge feature will be disabled.
         echo You can still use XFDF export.

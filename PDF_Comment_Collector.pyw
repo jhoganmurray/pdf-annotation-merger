@@ -40,12 +40,12 @@ except ImportError:
     )
     sys.exit(1)
 
-# Optional: pikepdf for direct PDF merging
+# Optional: pikepdf for direct PDF merging via XFDF
 PIKEPDF_AVAILABLE = False
 PIKEPDF_ERROR = None
 try:
     import pikepdf
-    from xfdf_importer import import_annotations_direct
+    from xfdf_importer import import_xfdf_content_to_pdf
     PIKEPDF_AVAILABLE = True
 except ImportError as e:
     PIKEPDF_ERROR = str(e)
@@ -520,8 +520,8 @@ class CommentCollectorApp:
             self.update_status()
 
     def merge_and_save(self):
-        """Merge new annotations directly into the base PDF."""
-        global PIKEPDF_AVAILABLE, PIKEPDF_ERROR, import_annotations_direct
+        """Merge new annotations into the base PDF via XFDF intermediate format."""
+        global PIKEPDF_AVAILABLE, PIKEPDF_ERROR, import_xfdf_content_to_pdf
 
         if not PIKEPDF_AVAILABLE:
             # Offer to install pikepdf
@@ -541,7 +541,7 @@ class CommentCollectorApp:
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     # Try importing again
                     import pikepdf
-                    from xfdf_importer import import_annotations_direct
+                    from xfdf_importer import import_xfdf_content_to_pdf
                     PIKEPDF_AVAILABLE = True
                     PIKEPDF_ERROR = None
                     self.status_var.set("pikepdf installed successfully!")
@@ -600,12 +600,20 @@ class CommentCollectorApp:
                     "All comments already exist in the base PDF.")
                 return
 
-            self.status_var.set(f"Merging {len(all_new)} annotations...")
-            self.progress_var.set(90)
+            self.status_var.set(f"Generating XFDF for {len(all_new)} annotations...")
+            self.progress_var.set(50)
             self.root.update()
 
-            # Use pikepdf to merge annotations directly
-            count = import_annotations_direct(self.base_file, all_new, save_path)
+            # Generate XFDF content from annotations
+            base_pdf_name = os.path.basename(self.base_file)
+            xfdf_content = create_xfdf(all_new, base_pdf_name)
+
+            self.status_var.set("Importing XFDF into PDF...")
+            self.progress_var.set(80)
+            self.root.update()
+
+            # Import XFDF content directly into the base PDF
+            count = import_xfdf_content_to_pdf(self.base_file, xfdf_content, save_path)
 
             self.progress_var.set(100)
             self.status_var.set("Merge complete!")

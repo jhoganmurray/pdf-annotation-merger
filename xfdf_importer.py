@@ -85,6 +85,73 @@ def parse_xfdf(xfdf_path: str) -> Tuple[str, List[Dict[str, Any]]]:
     return source_pdf, annotations
 
 
+def parse_xfdf_string(xfdf_content: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Parse XFDF content from a string and extract annotation data.
+
+    Args:
+        xfdf_content: XFDF XML content as a string
+
+    Returns:
+        Tuple of (source_pdf_name, list of annotation dicts)
+    """
+    root = ET.fromstring(xfdf_content)
+
+    # Handle namespace
+    ns = {'xfdf': 'http://ns.adobe.com/xfdf/'}
+
+    # Get source PDF name
+    f_elem = root.find('xfdf:f', ns) or root.find('f')
+    source_pdf = f_elem.get('href', '') if f_elem is not None else ''
+
+    # Find annots element
+    annots_elem = root.find('xfdf:annots', ns) or root.find('annots')
+    if annots_elem is None:
+        return source_pdf, []
+
+    annotations = []
+    for elem in annots_elem:
+        # Get tag name without namespace
+        tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+        annot = {
+            'type': tag,
+            'page': int(elem.get('page', '0')),
+            'rect': parse_rect(elem.get('rect', '0,0,0,0')),
+            'name': elem.get('name', ''),
+            'color': parse_color(elem.get('color')),
+            'title': elem.get('title', ''),
+            'subject': elem.get('subject', ''),
+            'opacity': float(elem.get('opacity', '1.0')),
+            'width': float(elem.get('width', '1.0')),
+            'flags': int(elem.get('flags', '4')),  # Default: Print flag
+        }
+
+        # Contents element
+        contents_elem = elem.find('xfdf:contents', ns) or elem.find('contents')
+        if contents_elem is not None and contents_elem.text:
+            annot['contents'] = contents_elem.text
+
+        # Type-specific data
+        if tag == 'ink':
+            annot['inklist'] = parse_inklist(elem, ns)
+        elif tag == 'line':
+            annot['start'] = parse_point(elem.get('start', '0,0'))
+            annot['end'] = parse_point(elem.get('end', '0,0'))
+        elif tag in ('highlight', 'underline', 'strikeout', 'squiggly'):
+            coords = elem.get('coords')
+            if coords:
+                annot['quadpoints'] = parse_coords(coords)
+        elif tag in ('polygon', 'polyline'):
+            vertices = elem.get('vertices')
+            if vertices:
+                annot['vertices'] = parse_coords(vertices)
+
+        annotations.append(annot)
+
+    return source_pdf, annotations
+
+
 def parse_rect(rect_str: str) -> List[float]:
     """Parse rect string "x1,y1,x2,y2" into list of floats."""
     return [float(x) for x in rect_str.split(',')]
@@ -315,6 +382,89 @@ def import_xfdf_to_pdf(
             annot_obj = pdf.make_indirect(annot_dict)
 
             # Note: P (page reference) is optional, skipping to avoid compatibility issues
+
+            annots_array.append(annot_obj)
+            imported_count += 1
+
+        # Update page's Annots array
+        page[Name.Annots] = Array(annots_array)
+
+    # Save the modified PDF
+    save_options = {}
+    if linearize:
+        save_options['linearize'] = True
+
+    pdf.save(output_path, **save_options)
+    pdf.close()
+
+    return imported_count
+
+
+def import_xfdf_content_to_pdf(
+    pdf_path: str,
+    xfdf_content: str,
+    output_path: str,
+    linearize: bool = False
+) -> int:
+    """
+    Import XFDF annotations from a string into a PDF file.
+
+    This allows importing annotations using XFDF as the intermediate
+    format without writing to a temporary file.
+
+    Args:
+        pdf_path: Path to the source PDF file
+        xfdf_content: XFDF XML content as a string
+        output_path: Path to save the modified PDF
+        linearize: Whether to linearize (optimize for web) the output
+
+    Returns:
+        Number of annotations imported
+    """
+    # Parse XFDF from string
+    _, annotations = parse_xfdf_string(xfdf_content)
+
+    if not annotations:
+        # No annotations to import - just copy the file
+        with open(pdf_path, 'rb') as src, open(output_path, 'wb') as dst:
+            dst.write(src.read())
+        return 0
+
+    # Open PDF
+    pdf = pikepdf.open(pdf_path, allow_overwriting_input=True)
+
+    # Group annotations by page
+    by_page: Dict[int, List[Dict]] = {}
+    for annot in annotations:
+        page_num = annot['page']
+        by_page.setdefault(page_num, []).append(annot)
+
+    imported_count = 0
+
+    # Add annotations to each page
+    for page_num, page_annots in by_page.items():
+        if page_num >= len(pdf.pages):
+            print(f"Warning: Page {page_num} does not exist, skipping annotations")
+            continue
+
+        page = pdf.pages[page_num]
+
+        # Get existing annots array, handling indirect references
+        annots_array = []
+        if Name.Annots in page:
+            existing = page[Name.Annots]
+            try:
+                for item in existing:
+                    annots_array.append(item)
+            except TypeError:
+                pass
+
+        # Add each annotation
+        for annot_data in page_annots:
+            annot_dict = create_annotation_dict(annot_data)
+
+            # Create indirect object for annotation
+            annot_obj = pdf.make_indirect(annot_dict)
 
             annots_array.append(annot_obj)
             imported_count += 1
